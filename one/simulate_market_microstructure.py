@@ -25,6 +25,28 @@ OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", PROJECT_ROOT / "data" / "simulated"))
 SIM_MAX_ABS_SECOND_RETURN = float(os.getenv("SIM_MAX_ABS_SECOND_RETURN", "0.0025"))
 SIM_MAX_ABS_MINUTE_RETURN = float(os.getenv("SIM_MAX_ABS_MINUTE_RETURN", "0.012"))
 SIM_MAX_CLOSE_TO_CLOSE_RETURN = float(os.getenv("SIM_MAX_CLOSE_TO_CLOSE_RETURN", "0.08"))
+SIM_RETURN_INNOVATION_MODE = os.getenv("SIM_RETURN_INNOVATION_MODE", "student_t").strip().lower()
+if SIM_RETURN_INNOVATION_MODE not in {"gaussian", "student_t", "mixture"}:
+    print(f"Unknown SIM_RETURN_INNOVATION_MODE={SIM_RETURN_INNOVATION_MODE}; using student_t.")
+    SIM_RETURN_INNOVATION_MODE = "student_t"
+SIM_STUDENT_T_DF = max(2.1, float(os.getenv("SIM_STUDENT_T_DF", "4.0")))
+SIM_JUMP_MIXTURE_PROBABILITY = float(os.getenv("SIM_JUMP_MIXTURE_PROBABILITY", "0.03"))
+SIM_JUMP_MIXTURE_SCALE = float(os.getenv("SIM_JUMP_MIXTURE_SCALE", "4.0"))
+SIM_VOL_PERSISTENCE = float(np.clip(float(os.getenv("SIM_VOL_PERSISTENCE", "0.95")), 0.0, 0.999))
+SIM_USE_SOFT_RETURN_LIMITS = os.getenv("SIM_USE_SOFT_RETURN_LIMITS", "true").strip().lower() in {"1", "true", "yes", "y"}
+SIM_SCENARIO_CAP_MULTIPLIER_ENV = os.getenv("SIM_SCENARIO_CAP_MULTIPLIER", "").strip()
+SIM_SCENARIO_CAP_MULTIPLIER_OVERRIDE = (
+    float(SIM_SCENARIO_CAP_MULTIPLIER_ENV) if SIM_SCENARIO_CAP_MULTIPLIER_ENV else None
+)
+SIM_EVENT_FREQUENCY_SCALE = float(os.getenv("SIM_EVENT_FREQUENCY_SCALE", "1.0"))
+SIM_REGIME_PERSISTENCE_SCALE_ENV = os.getenv("SIM_REGIME_PERSISTENCE_SCALE", "").strip()
+SIM_REGIME_PERSISTENCE_SCALE_OVERRIDE = (
+    float(SIM_REGIME_PERSISTENCE_SCALE_ENV) if SIM_REGIME_PERSISTENCE_SCALE_ENV else None
+)
+SIM_REGIME_TARGET_DURATION_SECONDS_ENV = os.getenv("SIM_REGIME_TARGET_DURATION_SECONDS", "").strip()
+SIM_REGIME_TARGET_DURATION_SECONDS_OVERRIDE = (
+    float(SIM_REGIME_TARGET_DURATION_SECONDS_ENV) if SIM_REGIME_TARGET_DURATION_SECONDS_ENV else None
+)
 SIM_PRICE_IMPACT_SCALE = float(os.getenv("SIM_PRICE_IMPACT_SCALE", "0.45"))
 SIM_EVENT_MAGNITUDE_SCALE = float(os.getenv("SIM_EVENT_MAGNITUDE_SCALE", "0.70"))
 SIM_WHALE_INTENSITY = float(os.getenv("SIM_WHALE_INTENSITY", "1.0"))
@@ -382,6 +404,58 @@ def sample_range(rng, values, default):
     return rng.uniform(low, high)
 
 
+BASE_LEVEL_SIZE_RAW = BASE_LEVEL_SIZE
+SIM_DEPTH_CALIBRATION_SCALE = 1.0
+SIM_DEPTH_TARGET_10BPS = 0.0
+SIM_DEPTH_HISTORICAL_10BPS = 0.0
+
+
+def scenario_depth_target_range(scenario):
+    scenario = str(scenario or "").lower()
+    if scenario == "calm_chop":
+        return 0.80, 1.30, 1.00
+    if "high_vol_chop" in scenario:
+        return 0.50, 1.00, 0.75
+    if any(token in scenario for token in ["bullish_breakout", "bearish_breakdown", "fakeout_reversal"]):
+        return 0.40, 0.90, 0.65
+    if "liquidity_crisis" in scenario:
+        return 0.10, 0.35, 0.22
+    if any(token in scenario for token in ["news_shock", "whale", "thin_book"]):
+        return 0.25, 0.75, 0.50
+    return 0.60, 1.20, 0.90
+
+
+def calibrated_base_level_size(raw_base_size):
+    if not isinstance(SIM_CALIBRATION, dict):
+        return raw_base_size, 1.0, 0.0, 0.0
+    spread_depth = SIM_CALIBRATION.get("spread_depth_regimes", {})
+    bid_info = spread_depth.get("bid_depth_10bps", {}) if isinstance(spread_depth, dict) else {}
+    ask_info = spread_depth.get("ask_depth_10bps", {}) if isinstance(spread_depth, dict) else {}
+    bid_mean = finite_float(bid_info.get("mean") if isinstance(bid_info, dict) else 0.0, 0.0)
+    ask_mean = finite_float(ask_info.get("mean") if isinstance(ask_info, dict) else 0.0, 0.0)
+    means = [value for value in [bid_mean, ask_mean] if value > 0]
+    if not means:
+        return raw_base_size, 1.0, 0.0, 0.0
+    historical_target = float(np.mean(means))
+    # Empirical depth proxy: with the default 120 base size, calm synthetic
+    # books have tended to sit around ~27k units inside 10 bps. Use that
+    # relationship to pull calibrated runs toward historical depth without
+    # changing live/training code or requiring an expensive dry run.
+    default_depth_proxy = max(raw_base_size * 225.0, 1e-9)
+    _, _, scenario_multiplier = scenario_depth_target_range(SCENARIO)
+    target_depth = historical_target * scenario_multiplier
+    scale = float(np.clip(target_depth / default_depth_proxy, 0.05, 1.50))
+    return raw_base_size * scale, scale, target_depth, historical_target
+
+
+(
+    BASE_LEVEL_SIZE,
+    SIM_DEPTH_CALIBRATION_SCALE,
+    SIM_DEPTH_TARGET_10BPS,
+    SIM_DEPTH_HISTORICAL_10BPS,
+) = calibrated_base_level_size(BASE_LEVEL_SIZE_RAW)
+
+
 def weighted_choice(rng, weights, default):
     if not isinstance(weights, dict) or not weights:
         return default
@@ -395,6 +469,250 @@ def weighted_choice(rng, weights, default):
         if draw <= cumulative:
             return key
     return default
+
+
+def scenario_cap_multiplier(scenario):
+    if SIM_SCENARIO_CAP_MULTIPLIER_OVERRIDE is not None:
+        return max(0.05, SIM_SCENARIO_CAP_MULTIPLIER_OVERRIDE)
+    scenario = str(scenario or "").lower()
+    if scenario == "calm_chop":
+        return 0.75
+    if any(token in scenario for token in ["liquidity_crisis", "thin_book", "whale"]):
+        return 2.25
+    if any(token in scenario for token in ["news", "fakeout", "high_vol"]):
+        return 1.85
+    if any(token in scenario for token in ["breakout", "breakdown", "macro"]):
+        return 1.45
+    if any(token in scenario for token in ["accumulation", "distribution"]):
+        return 1.20
+    return 1.0
+
+
+def scenario_event_frequency_default(scenario):
+    scenario = str(scenario or "").lower()
+    if scenario == "calm_chop":
+        return 0.10
+    if "high_vol_chop" in scenario:
+        return 0.35
+    if any(token in scenario for token in ["bullish_breakout", "bearish_breakdown", "fakeout_reversal"]):
+        return 0.50
+    if "liquidity_crisis" in scenario:
+        return 0.85
+    if "whale_pump_and_dump" in scenario:
+        return 1.00
+    if "news_shock" in scenario:
+        return 0.85
+    return 0.60
+
+
+def scenario_event_policy(scenario):
+    scenario = str(scenario or "").lower()
+    if scenario == "calm_chop":
+        return {
+            "allowed": {"fake_breakout", "mean_reversion_snapback"},
+            "per_event_scale": {"fake_breakout": 0.25, "mean_reversion_snapback": 0.20},
+            "magnitude_scale": 0.35,
+            "duration_scale": 0.50,
+        }
+    if "high_vol_chop" in scenario:
+        return {
+            "allowed": {"positive_news", "negative_news", "fake_breakout", "liquidity_vacuum"},
+            "per_event_scale": {"positive_news": 0.45, "negative_news": 0.45, "liquidity_vacuum": 0.35},
+            "magnitude_scale": 0.65,
+            "duration_scale": 0.75,
+        }
+    return {
+        "allowed": None,
+        "per_event_scale": {},
+        "magnitude_scale": 1.0,
+        "duration_scale": 1.0,
+    }
+
+
+def effective_event_frequency_scale(scenario):
+    return max(0.0, SIM_EVENT_FREQUENCY_SCALE * scenario_event_frequency_default(scenario))
+
+
+def scenario_directional_drift_scale(scenario):
+    scenario = str(scenario or "").lower()
+    if scenario == "calm_chop":
+        return 0.000045
+    if "high_vol_chop" in scenario:
+        return 0.00010
+    if any(token in scenario for token in ["liquidity_crisis", "news_shock", "whale"]):
+        return 0.00016
+    return 0.00014
+
+
+def scenario_event_demand_scale(scenario):
+    scenario = str(scenario or "").lower()
+    if scenario == "calm_chop":
+        return 0.018
+    if "high_vol_chop" in scenario:
+        return 0.032
+    if any(token in scenario for token in ["bullish_breakout", "bearish_breakdown", "fakeout_reversal"]):
+        return 0.042
+    return 0.055
+
+
+def scenario_trend_bias_scale(scenario):
+    scenario = str(scenario or "").lower()
+    if scenario == "calm_chop":
+        return 0.25
+    if "high_vol_chop" in scenario:
+        return 0.50
+    if "fakeout_reversal" in scenario:
+        return 0.80
+    return 1.0
+
+
+def scenario_regime_persistence_scale(scenario, calibration=None):
+    if SIM_REGIME_PERSISTENCE_SCALE_OVERRIDE is not None:
+        return max(0.10, SIM_REGIME_PERSISTENCE_SCALE_OVERRIDE)
+    scenario = str(scenario or "").lower()
+    if scenario == "calm_chop":
+        scale = 0.45
+    elif "high_vol_chop" in scenario:
+        scale = 0.55
+    elif "fakeout_reversal" in scenario:
+        scale = 0.65
+    elif any(token in scenario for token in ["news_shock", "liquidity_crisis", "whale"]):
+        scale = 0.75
+    else:
+        scale = 0.85
+    if isinstance(calibration, dict):
+        durations = calibration.get("regime_duration_distributions", {})
+        means = [
+            finite_float(info.get("mean_seconds"), 0.0)
+            for info in durations.values()
+            if isinstance(info, dict) and finite_float(info.get("mean_seconds"), 0.0) > 0
+        ]
+        if means:
+            historical_mean = float(np.mean(means))
+            scale = min(scale, float(np.clip(historical_mean / 600.0, 0.20, 1.0)))
+    return max(0.10, scale)
+
+
+def calibrated_regime_duration_seconds(calibration):
+    if not isinstance(calibration, dict):
+        return 0.0
+    durations = calibration.get("regime_duration_distributions", {})
+    candidates = []
+    for info in durations.values():
+        if not isinstance(info, dict):
+            continue
+        quantiles = info.get("quantiles_seconds", {})
+        median = finite_float(quantiles.get("0.5") if isinstance(quantiles, dict) else None, 0.0)
+        mean = finite_float(info.get("mean_seconds"), 0.0)
+        if mean > 0:
+            candidates.append(mean)
+        elif median > 0:
+            candidates.append(median)
+    return float(np.median(candidates)) if candidates else 0.0
+
+
+def scenario_regime_duration_multiplier(scenario):
+    scenario = str(scenario or "").lower()
+    if scenario == "calm_chop":
+        return 1.35
+    if "high_vol_chop" in scenario:
+        return 1.00
+    if any(token in scenario for token in ["bullish_breakout", "bearish_breakdown"]):
+        return 3.00
+    if "fakeout_reversal" in scenario:
+        return 2.25
+    if "liquidity_crisis" in scenario:
+        return 3.50
+    return 2.00
+
+
+def scenario_regime_target_duration_seconds(scenario, calibration=None):
+    if SIM_REGIME_TARGET_DURATION_SECONDS_OVERRIDE is not None:
+        return max(10.0, SIM_REGIME_TARGET_DURATION_SECONDS_OVERRIDE)
+    historical = calibrated_regime_duration_seconds(calibration)
+    if historical <= 0:
+        return 0.0
+    target = historical * scenario_regime_duration_multiplier(scenario)
+    return float(np.clip(target, 30.0, 900.0))
+
+
+def apply_persistence_scale(persistence, scale):
+    scale = max(0.10, finite_float(scale, 1.0))
+    return float(np.clip(1.0 - (1.0 - persistence) / scale, 0.50, 0.9995))
+
+
+def effective_return_caps(scenario):
+    multiplier = scenario_cap_multiplier(scenario)
+    return {
+        "scenario_cap_multiplier": multiplier,
+        "second": max(0.0, SIM_MAX_ABS_SECOND_RETURN * multiplier),
+        "minute": max(0.0, SIM_MAX_ABS_MINUTE_RETURN * multiplier),
+        "close_to_close": max(0.0, SIM_MAX_CLOSE_TO_CLOSE_RETURN * multiplier),
+    }
+
+
+def soft_limit_return(value, limit):
+    """Compress extreme returns instead of deleting them with a hard cap."""
+    value = finite_float(value, 0.0)
+    limit = abs(finite_float(limit, 0.0))
+    if limit <= 0.0:
+        return value
+    magnitude = abs(value)
+    if magnitude <= limit:
+        return value
+    excess = magnitude - limit
+    compressed = limit + math.log1p(excess / max(limit, 1e-12)) * limit * 0.35
+    return math.copysign(compressed, value)
+
+
+def bounded_return(value, limit, use_soft_limits=True):
+    value = finite_float(value, 0.0)
+    limit = abs(finite_float(limit, 0.0))
+    if limit <= 0.0:
+        return value
+    if use_soft_limits:
+        return soft_limit_return(value, limit)
+    return float(np.clip(value, -limit, limit))
+
+
+def absurdity_guard_price(price):
+    price = finite_float(price, START_PRICE)
+    if price <= 0:
+        return PRICE_TICK
+    lower = max(PRICE_TICK, START_PRICE * 0.02)
+    upper = max(lower * 1.01, START_PRICE * 50.0)
+    return float(np.clip(price, lower, upper))
+
+
+def sample_laplace(rng, scale):
+    scale = max(float(scale), 1e-12)
+    sign = -1.0 if rng.random() < 0.5 else 1.0
+    return sign * rng.expovariate(1.0 / scale)
+
+
+def sample_student_t_unit_variance(rng, df):
+    df = max(2.1, float(df))
+    z = rng.gauss(0.0, 1.0)
+    chi_square = rng.gammavariate(df / 2.0, 2.0)
+    t_value = z / math.sqrt(max(chi_square / df, 1e-12))
+    variance_normalizer = math.sqrt((df - 2.0) / df)
+    return t_value * variance_normalizer
+
+
+def sample_return_innovation(rng, volatility_regime):
+    volatility = max(0.0, finite_float(volatility_regime, 0.0))
+    if volatility <= 0.0:
+        return 0.0
+    if SIM_RETURN_INNOVATION_MODE == "gaussian":
+        return rng.gauss(0.0, volatility)
+    if SIM_RETURN_INNOVATION_MODE == "student_t":
+        return sample_student_t_unit_variance(rng, SIM_STUDENT_T_DF) * volatility
+    if rng.random() < max(0.0, min(1.0, SIM_JUMP_MIXTURE_PROBABILITY)):
+        jump_scale = volatility * max(1.0, SIM_JUMP_MIXTURE_SCALE)
+        if rng.random() < 0.5:
+            return rng.gauss(0.0, jump_scale)
+        return sample_laplace(rng, jump_scale / math.sqrt(2.0))
+    return rng.gauss(0.0, volatility)
 
 
 def poisson_sample(rng, expected_count):
@@ -530,12 +848,12 @@ class LimitOrderBook:
             "levels_touched": levels_touched,
         }
 
-    def replenish_around(self, fair_value, liquidity):
+    def replenish_around(self, fair_value, liquidity, depth_multiplier=1.0):
         mid = self.mid_price()
         anchor = 0.70 * mid + 0.30 * fair_value
         for level in range(1, LEVEL_COUNT + 1):
             decay = math.exp(-level / 42.0)
-            size = BASE_LEVEL_SIZE * liquidity * decay * self.rng.uniform(0.15, 0.55)
+            size = BASE_LEVEL_SIZE * liquidity * depth_multiplier * decay * self.rng.uniform(0.15, 0.55)
             self.bids[round_price(anchor - level * PRICE_TICK)] += size
             self.asks[round_price(anchor + level * PRICE_TICK)] += size
         self.clean()
@@ -646,7 +964,7 @@ class LatentState:
         self.rng = rng
         self.preset = preset
         self.fair_value = START_PRICE
-        self.trend_bias = preset["trend_bias"]
+        self.trend_bias = preset["trend_bias"] * scenario_trend_bias_scale(scenario)
         self.volatility_regime = preset["volatility"]
         self.liquidity_regime = preset["liquidity"]
         self.news_shock = 0.0
@@ -655,8 +973,25 @@ class LatentState:
         self.base_liquidity = preset["liquidity"]
         self.base_risk_aversion = preset["risk_aversion"]
         self.base_volatility = preset["volatility"]
+        self.return_caps = effective_return_caps(scenario)
+        self.event_frequency_scale = effective_event_frequency_scale(scenario)
+        self.event_policy = scenario_event_policy(scenario)
+        self.event_demand_scale = scenario_event_demand_scale(scenario)
+        self.directional_drift_scale = scenario_directional_drift_scale(scenario)
+        self.regime_persistence_scale = scenario_regime_persistence_scale(scenario, SIM_CALIBRATION)
+        self.regime_target_duration_seconds = scenario_regime_target_duration_seconds(scenario, SIM_CALIBRATION)
+        self.next_regime_flip_second = 0
+        self.latent_regime_label = "chop"
+        self.book_depth_multiplier = 1.0
+        self.depth_ema_10bps = 0.0
+        self.depth_feedback_updates = 0
+        self.depth_target_10bps = SIM_DEPTH_TARGET_10BPS
+        self.depth_historical_10bps = SIM_DEPTH_HISTORICAL_10BPS
+        depth_min_multiplier, depth_max_multiplier, _ = scenario_depth_target_range(scenario)
+        self.depth_target_min_10bps = self.depth_historical_10bps * depth_min_multiplier
+        self.depth_target_max_10bps = self.depth_historical_10bps * depth_max_multiplier
         self.demands = {key: float(preset.get("demand_bias", {}).get(key, 0.0)) for key in DEMAND_KEYS}
-        self.demand_persistence = {
+        base_demand_persistence = {
             "retail": 0.985,
             "institutional": 0.998,
             "momentum": 0.965,
@@ -665,6 +1000,10 @@ class LatentState:
             "panic": 0.955,
             "news": 0.930,
             "macro_risk": 0.997,
+        }
+        self.demand_persistence = {
+            key: apply_persistence_scale(value, self.regime_persistence_scale)
+            for key, value in base_demand_persistence.items()
         }
         self.events = [
             SyntheticEvent(
@@ -681,10 +1020,13 @@ class LatentState:
         self.waveform_points = []
         self.waveform_offset = 0.0
         self.waveform_scale = 0.0
+        self.waveform_bands = []
         self.waveform_value = 0.0
         self.waveform_contribution = 0.0
         if self.calibration:
             self.apply_calibration()
+        self.latent_regime_label = self.calibration_regime if self.calibration_regime != "none" else "chop"
+        self.schedule_next_regime_flip(0)
         self.generated_events = list(self.events)
         self.active_events = []
         self.active_event_type = "none"
@@ -694,6 +1036,85 @@ class LatentState:
 
     def simulator_parameters(self):
         return self.calibration.get("simulator_parameters", {}) if isinstance(self.calibration, dict) else {}
+
+    def schedule_next_regime_flip(self, current_second=0):
+        if self.regime_target_duration_seconds <= 0:
+            self.next_regime_flip_second = 0
+            return
+        sampled = self.rng.expovariate(1.0 / max(self.regime_target_duration_seconds, 1.0))
+        sampled = float(np.clip(sampled, self.regime_target_duration_seconds * 0.35, self.regime_target_duration_seconds * 2.50))
+        self.next_regime_flip_second = int(current_second + max(15.0, sampled))
+
+    def choose_next_latent_regime(self):
+        params = self.simulator_parameters()
+        probabilities = params.get("regime_probabilities", {}) if isinstance(params, dict) else {}
+        next_label = weighted_choice(self.rng, probabilities, "chop")
+        if next_label == self.latent_regime_label and self.rng.random() < 0.65:
+            alternatives = [label for label in ["chop", "uptrend", "downtrend", "high_vol_chop"] if label != next_label]
+            next_label = self.rng.choice(alternatives)
+        return next_label
+
+    def apply_latent_regime(self, label):
+        params = self.simulator_parameters()
+        trend_ranges = params.get("trend_bias_ranges", {}) if isinstance(params, dict) else {}
+        volatility_ranges = params.get("volatility_ranges", {}) if isinstance(params, dict) else {}
+        self.latent_regime_label = label
+        if label == "uptrend":
+            self.trend_bias = abs(sample_range(self.rng, trend_ranges.get("uptrend_per_second"), max(abs(self.trend_bias), 0.000012)))
+            self.demands["momentum"] = abs(self.demands.get("momentum", 0.0)) + self.rng.uniform(0.015, 0.060)
+            self.demands["mean_reversion"] *= 0.65
+        elif label == "downtrend":
+            self.trend_bias = -abs(sample_range(self.rng, trend_ranges.get("downtrend_per_second"), max(abs(self.trend_bias), 0.000012)))
+            self.demands["momentum"] = -abs(self.demands.get("momentum", 0.0)) - self.rng.uniform(0.015, 0.060)
+            self.demands["panic"] = max(self.demands.get("panic", 0.0), self.rng.uniform(0.010, 0.050))
+        elif label == "high_vol_chop":
+            self.trend_bias = sample_range(self.rng, trend_ranges.get("chop_per_second"), 0.0)
+            self.base_volatility = sample_range(self.rng, volatility_ranges.get("high_vol_per_second"), self.base_volatility)
+            self.demands["mean_reversion"] = abs(self.demands.get("mean_reversion", 0.0)) + self.rng.uniform(0.020, 0.070)
+            self.demands["liquidity"] -= self.rng.uniform(0.020, 0.080)
+        else:
+            self.trend_bias = sample_range(self.rng, trend_ranges.get("chop_per_second"), 0.0)
+            self.demands["mean_reversion"] = abs(self.demands.get("mean_reversion", 0.0)) + self.rng.uniform(0.015, 0.060)
+            self.demands["momentum"] *= 0.55
+        self.trend_bias *= scenario_trend_bias_scale(self.scenario)
+        for key in DEMAND_KEYS:
+            self.demands[key] = float(np.clip(self.demands.get(key, 0.0), -1.5, 1.5))
+
+    def maybe_flip_latent_regime(self, second):
+        if self.regime_target_duration_seconds <= 0:
+            return
+        if self.next_regime_flip_second <= 0:
+            self.schedule_next_regime_flip(second)
+            return
+        if second < self.next_regime_flip_second:
+            return
+        self.apply_latent_regime(self.choose_next_latent_regime())
+        self.schedule_next_regime_flip(second)
+
+    def update_depth_feedback(self, bid_depth_10bps, ask_depth_10bps):
+        if self.depth_target_10bps <= 0:
+            return
+        realized = (finite_float(bid_depth_10bps, 0.0) + finite_float(ask_depth_10bps, 0.0)) / 2.0
+        if realized <= 0:
+            return
+        alpha = 0.04
+        if self.depth_feedback_updates == 0:
+            self.depth_ema_10bps = realized
+        else:
+            self.depth_ema_10bps = (1.0 - alpha) * self.depth_ema_10bps + alpha * realized
+        self.depth_feedback_updates += 1
+        target = self.depth_target_10bps
+        severe_liquidity_event = self.active_event_type in {"exchange_outage", "liquidity_vacuum"}
+        lower_guard = self.depth_target_min_10bps if not severe_liquidity_event else self.depth_historical_10bps * 0.03
+        upper_guard = self.depth_target_max_10bps
+        ratio = target / max(self.depth_ema_10bps, 1e-9)
+        exponent = 0.035
+        if lower_guard > 0 and self.depth_ema_10bps < lower_guard:
+            exponent = 0.075
+        elif upper_guard > 0 and self.depth_ema_10bps > upper_guard:
+            exponent = 0.075
+        adjustment = float(np.clip(ratio, 0.70, 1.35) ** exponent)
+        self.book_depth_multiplier = float(np.clip(self.book_depth_multiplier * adjustment, 0.08, 6.0))
 
     def apply_calibration(self):
         params = self.simulator_parameters()
@@ -756,9 +1177,41 @@ class LatentState:
                 sampled = abs(sampled)
             self.demands[key] = float(np.clip(sampled, -1.5, 1.5))
 
+        self.trend_bias *= scenario_trend_bias_scale(self.scenario)
         self.append_calibrated_events(params.get("event_frequency_distributions", {}))
-        waveform = self.calibration.get("fair_value_waveform", {}) if isinstance(self.calibration, dict) else {}
+        self.load_waveform_bands()
+
+    def load_one_waveform_band(self, name, waveform):
+        if not isinstance(waveform, dict):
+            return
         points = waveform.get("normalized_points", [])
+        if not isinstance(points, list) or len(points) < 4:
+            return
+        scale = finite_float(waveform.get("wave_drift_scale_per_second"), 0.0)
+        if scale <= 0:
+            return
+        self.waveform_bands.append(
+            {
+                "name": name,
+                "points": [finite_float(value, 0.0) for value in points],
+                "offset": self.rng.uniform(0, len(points)),
+                "scale": scale,
+                "dominant_period_seconds": finite_float(waveform.get("dominant_period_seconds"), 0.0),
+                "band_energy_fraction": finite_float(waveform.get("band_energy_fraction"), 0.0),
+            }
+        )
+
+    def load_waveform_bands(self):
+        if not isinstance(self.calibration, dict):
+            return
+        waveforms = self.calibration.get("fair_value_waveforms", {})
+        if isinstance(waveforms, dict):
+            for name in ["session", "low", "mid", "high"]:
+                self.load_one_waveform_band(name, waveforms.get(name, {}))
+        if self.waveform_bands:
+            return
+        waveform = self.calibration.get("fair_value_waveform", {})
+        points = waveform.get("normalized_points", []) if isinstance(waveform, dict) else []
         if isinstance(points, list) and len(points) >= 4:
             self.waveform_points = [finite_float(value, 0.0) for value in points]
             self.waveform_offset = self.rng.uniform(0, len(self.waveform_points))
@@ -769,17 +1222,29 @@ class LatentState:
             return
         sim_days = SIM_SECONDS / 86400.0
         added = 0
+        policy = self.event_policy
+        allowed = policy.get("allowed")
+        per_event_scale = policy.get("per_event_scale", {})
+        magnitude_scale = finite_float(policy.get("magnitude_scale"), 1.0)
+        duration_scale = finite_float(policy.get("duration_scale"), 1.0)
         for event_type, info in event_params.items():
             if not isinstance(info, dict) or "frequency_per_day" not in info:
                 continue
-            expected = finite_float(info.get("frequency_per_day"), 0.0) * sim_days
+            if allowed is not None and event_type not in allowed:
+                continue
+            event_scale = self.event_frequency_scale * finite_float(per_event_scale.get(event_type), 1.0)
+            expected = finite_float(info.get("frequency_per_day"), 0.0) * sim_days * event_scale
             count = min(6, poisson_sample(self.rng, expected))
             for _ in range(count):
                 direction = int(finite_float(info.get("direction"), 0.0))
                 if direction == 0:
                     direction = 1 if self.rng.random() < 0.5 else -1
-                magnitude = sample_range(self.rng, info.get("magnitude_range"), 0.25) * SIM_EVENT_MAGNITUDE_SCALE
-                duration = int(sample_range(self.rng, info.get("duration_seconds_range"), 600))
+                magnitude = (
+                    sample_range(self.rng, info.get("magnitude_range"), 0.25)
+                    * SIM_EVENT_MAGNITUDE_SCALE
+                    * magnitude_scale
+                )
+                duration = int(sample_range(self.rng, info.get("duration_seconds_range"), 600) * duration_scale)
                 latest_start = max(1, SIM_SECONDS - max(1, duration))
                 start_second = self.rng.randint(0, latest_start)
                 self.events.append(
@@ -803,6 +1268,29 @@ class LatentState:
         high = (low + 1) % len(self.waveform_points)
         fraction = position - math.floor(position)
         return (1.0 - fraction) * self.waveform_points[low] + fraction * self.waveform_points[high]
+
+    def waveform_band_at(self, band, second):
+        points = band.get("points", [])
+        if not points:
+            return 0.0
+        position = (second / max(1, SIM_SECONDS)) * len(points) + finite_float(band.get("offset"), 0.0)
+        low = int(math.floor(position)) % len(points)
+        high = (low + 1) % len(points)
+        fraction = position - math.floor(position)
+        return (1.0 - fraction) * points[low] + fraction * points[high]
+
+    def multiband_waveform_contribution_at(self, second):
+        if not self.waveform_bands:
+            return 0.0, 0.0
+        total_value = 0.0
+        total_contribution = 0.0
+        for band in self.waveform_bands:
+            value = self.waveform_band_at(band, second)
+            previous = self.waveform_band_at(band, max(0, second - 1))
+            contribution = (value - previous) * finite_float(band.get("scale"), 0.0)
+            total_value += value
+            total_contribution += contribution
+        return total_value, float(np.clip(total_contribution, -0.00012, 0.00012))
 
     def demand(self, key):
         return float(self.demands.get(key, 0.0))
@@ -850,6 +1338,7 @@ class LatentState:
 
     def update(self, second):
         progress = second / max(1, SIM_SECONDS)
+        self.maybe_flip_latent_regime(second)
         event_contributions = self.update_event_demands(second)
         for key in DEMAND_KEYS:
             base = float(self.preset.get("demand_bias", {}).get(key, 0.0))
@@ -857,7 +1346,7 @@ class LatentState:
             self.demands[key] = (
                 self.demand_persistence[key] * self.demands[key]
                 + (1.0 - self.demand_persistence[key]) * base
-                + event_contributions.get(key, 0.0) * 0.055
+                + event_contributions.get(key, 0.0) * self.event_demand_scale
                 + noise
             )
             self.demands[key] = float(np.clip(self.demands[key], -1.5, 1.5))
@@ -872,24 +1361,42 @@ class LatentState:
         self.news_shock = self.demand("news") * 0.006
         self.risk_aversion = float(np.clip(self.base_risk_aversion + abs(self.demand("panic")) * 0.32 + max(-self.demand("liquidity"), 0) * 0.18, 0.05, 1.0))
         self.liquidity_regime = float(np.clip(self.base_liquidity * (1.0 + self.demand("liquidity") * 0.55 - self.risk_aversion * 0.18), 0.12, 2.2))
-        self.volatility_regime = float(np.clip(self.base_volatility * (1.0 + abs(directional) * 2.2 + self.risk_aversion * 0.8), 0.000025, 0.0012))
-        noise = self.rng.gauss(0.0, self.volatility_regime)
+        target_volatility = float(np.clip(self.base_volatility * (1.0 + abs(directional) * 2.2 + self.risk_aversion * 0.8), 0.000025, 0.0012))
+        self.volatility_regime = float(
+            np.clip(
+                SIM_VOL_PERSISTENCE * self.volatility_regime
+                + (1.0 - SIM_VOL_PERSISTENCE) * target_volatility,
+                0.000025,
+                0.0012,
+            )
+        )
+        noise = sample_return_innovation(self.rng, self.volatility_regime)
         self.waveform_value = 0.0
         self.waveform_contribution = 0.0
-        if SIM_FAIR_VALUE_MODE == "historical_wave_calibrated" and self.waveform_points:
-            self.waveform_value = self.waveform_at(second)
-            previous_wave = self.waveform_at(max(0, second - 1))
-            self.waveform_contribution = float(
-                np.clip((self.waveform_value - previous_wave) * self.waveform_scale, -0.00008, 0.00008)
-            )
-        drift = self.trend_bias + directional * 0.00018
+        if SIM_FAIR_VALUE_MODE == "historical_wave_calibrated":
+            if self.waveform_bands:
+                self.waveform_value, self.waveform_contribution = self.multiband_waveform_contribution_at(second)
+            elif self.waveform_points:
+                self.waveform_value = self.waveform_at(second)
+                previous_wave = self.waveform_at(max(0, second - 1))
+                self.waveform_contribution = float(
+                    np.clip((self.waveform_value - previous_wave) * self.waveform_scale, -0.00008, 0.00008)
+                )
+        drift = self.trend_bias + directional * self.directional_drift_scale
         drift += self.waveform_contribution
-        second_return = float(np.clip(drift + noise, -SIM_MAX_ABS_SECOND_RETURN, SIM_MAX_ABS_SECOND_RETURN))
-        self.fair_value = max(PRICE_TICK, self.fair_value * (1.0 + second_return))
-        if SIM_MAX_CLOSE_TO_CLOSE_RETURN > 0:
-            lower = START_PRICE * max(0.05, 1.0 - SIM_MAX_CLOSE_TO_CLOSE_RETURN)
-            upper = START_PRICE * (1.0 + SIM_MAX_CLOSE_TO_CLOSE_RETURN)
-            self.fair_value = float(np.clip(self.fair_value, lower, upper))
+        second_return = bounded_return(
+            drift + noise,
+            self.return_caps["second"],
+            SIM_USE_SOFT_RETURN_LIMITS,
+        )
+        self.fair_value = absurdity_guard_price(self.fair_value * (1.0 + second_return))
+        close_to_close_return = safe_ratio(self.fair_value - START_PRICE, START_PRICE)
+        capped_close_return = bounded_return(
+            close_to_close_return,
+            self.return_caps["close_to_close"],
+            SIM_USE_SOFT_RETURN_LIMITS,
+        )
+        self.fair_value = absurdity_guard_price(START_PRICE * (1.0 + capped_close_return))
 
 
 class BotSwarm:
@@ -931,7 +1438,7 @@ class BotSwarm:
         inventory_skew = safe_ratio(-self.last_whale_pressure, BASE_LEVEL_SIZE * 20.0)
         risk_multiplier = max(0.15, 1.0 - self.state.risk_aversion * 0.55 - self.state.volatility_regime * 400.0)
         withdrawal_multiplier = 0.35 if self.liquidity_withdrawal_seconds > 0 else 1.0
-        base_size = BASE_LEVEL_SIZE * self.state.liquidity_regime * risk_multiplier * withdrawal_multiplier
+        base_size = BASE_LEVEL_SIZE * self.state.liquidity_regime * self.state.book_depth_multiplier * risk_multiplier * withdrawal_multiplier
         for level in range(1, 7):
             size = base_size * math.exp(-level / 5.0) * self.rng.uniform(0.35, 0.95)
             buy_skew = 1.0 + max((skew + inventory_skew) * 70, 0)
@@ -947,7 +1454,7 @@ class BotSwarm:
     def mean_reversion_liquidity_provider(self):
         mid = self.book.mid_price()
         deviation = safe_ratio(mid - self.state.fair_value, self.state.fair_value)
-        size = BASE_LEVEL_SIZE * self.state.liquidity_regime * self.rng.uniform(0.2, 0.8)
+        size = BASE_LEVEL_SIZE * self.state.liquidity_regime * self.state.book_depth_multiplier * self.rng.uniform(0.2, 0.8)
         if deviation > 0:
             self.book.place_limit("sell", mid + self.rng.randint(2, 10) * PRICE_TICK, size * (1 + abs(deviation) * 200))
             self.book.place_limit("buy", mid - self.rng.randint(8, 18) * PRICE_TICK, size * 0.4)
@@ -974,7 +1481,7 @@ class BotSwarm:
         mid = self.book.mid_price()
         offset = self.rng.randint(1, 25) * PRICE_TICK
         price = mid - offset if side == "buy" else mid + offset
-        self.book.place_limit(side, price, BASE_LEVEL_SIZE * self.rng.uniform(0.05, 0.45))
+        self.book.place_limit(side, price, BASE_LEVEL_SIZE * self.state.book_depth_multiplier * self.rng.uniform(0.05, 0.45))
         return None
 
     def casual_trader(self):
@@ -1042,7 +1549,11 @@ class BotSwarm:
             mid = self.book.mid_price()
             offset = self.rng.randint(3, 20) * PRICE_TICK
             price = mid - offset if side == "buy" else mid + offset
-            self.book.place_limit(side, price, BASE_LEVEL_SIZE * self.rng.uniform(0.4, 1.8) * SIM_INSTITUTIONAL_INTENSITY)
+            self.book.place_limit(
+                side,
+                price,
+                BASE_LEVEL_SIZE * self.state.book_depth_multiplier * self.rng.uniform(0.4, 1.8) * SIM_INSTITUTIONAL_INTENSITY,
+            )
             return None
         size = BASE_LEVEL_SIZE * self.rng.lognormvariate(-0.2, 0.7) * SIM_INSTITUTIONAL_INTENSITY
         return self.action("long_term_investor", side, size)
@@ -1087,11 +1598,17 @@ class BotSwarm:
             fills.append(fill)
             if fill["filled"] > 0:
                 self.last_active_agent_types.append(action["agent"])
-        self.book.replenish_around(self.state.fair_value, self.state.liquidity_regime)
+        self.book.replenish_around(
+            self.state.fair_value,
+            self.state.liquidity_regime,
+            self.state.book_depth_multiplier,
+        )
         after_mid = self.book.mid_price()
         raw_return = safe_ratio(after_mid - before_mid, before_mid)
-        if abs(raw_return) > SIM_MAX_ABS_SECOND_RETURN:
-            capped_mid = before_mid * (1.0 + np.sign(raw_return) * SIM_MAX_ABS_SECOND_RETURN)
+        second_cap = effective_return_caps(self.state.scenario)["second"]
+        limited_return = bounded_return(raw_return, second_cap, SIM_USE_SOFT_RETURN_LIMITS)
+        if abs(limited_return - raw_return) > 1e-12:
+            capped_mid = before_mid * (1.0 + limited_return)
             self.book.shift_prices(capped_mid)
             after_mid = self.book.mid_price()
             raw_return = safe_ratio(after_mid - before_mid, before_mid)
@@ -1305,18 +1822,21 @@ def write_csv(path, columns, rows):
 
 def apply_book_price_caps(book, minute_open_mid):
     """Keep synthetic prices inside configured pretraining realism bounds."""
+    caps = effective_return_caps(SCENARIO)
     mid = book.mid_price()
-    if SIM_MAX_ABS_MINUTE_RETURN > 0 and minute_open_mid and minute_open_mid > 0:
+    if caps["minute"] > 0 and minute_open_mid and minute_open_mid > 0:
         minute_return = safe_ratio(mid - minute_open_mid, minute_open_mid)
-        if abs(minute_return) > SIM_MAX_ABS_MINUTE_RETURN:
-            capped_mid = minute_open_mid * (1.0 + np.sign(minute_return) * SIM_MAX_ABS_MINUTE_RETURN)
+        limited_minute_return = bounded_return(minute_return, caps["minute"], SIM_USE_SOFT_RETURN_LIMITS)
+        if abs(limited_minute_return - minute_return) > 1e-12:
+            capped_mid = absurdity_guard_price(minute_open_mid * (1.0 + limited_minute_return))
             book.shift_prices(capped_mid)
             mid = book.mid_price()
 
-    if SIM_MAX_CLOSE_TO_CLOSE_RETURN > 0 and START_PRICE > 0:
+    if caps["close_to_close"] > 0 and START_PRICE > 0:
         full_return = safe_ratio(mid - START_PRICE, START_PRICE)
-        if abs(full_return) > SIM_MAX_CLOSE_TO_CLOSE_RETURN:
-            capped_mid = START_PRICE * (1.0 + np.sign(full_return) * SIM_MAX_CLOSE_TO_CLOSE_RETURN)
+        limited_full_return = bounded_return(full_return, caps["close_to_close"], SIM_USE_SOFT_RETURN_LIMITS)
+        if abs(limited_full_return - full_return) > 1e-12:
+            capped_mid = absurdity_guard_price(START_PRICE * (1.0 + limited_full_return))
             book.shift_prices(capped_mid)
 
 
@@ -1340,6 +1860,7 @@ def run_simulation():
         apply_book_price_caps(book, minute_open_mid)
         timestamp_ms = START_TIMESTAMP_MS + second * 1000
         snapshot = snapshot_from_book(timestamp_ms, book, state, fills, previous_snapshot)
+        state.update_depth_feedback(snapshot["bid_depth_10bps"], snapshot["ask_depth_10bps"])
         snapshots.append(snapshot)
         minute_bucket.append(snapshot)
         previous_snapshot = snapshot
@@ -1382,16 +1903,25 @@ def max_drawdown_and_runup(close_values):
     return float(np.min(drawdown)), float(np.max(runup)), drawdown, runup
 
 
-def trend_chop_duration_summary(close_values):
+def trend_chop_duration_summary(close_values, step_seconds=60):
     close = np.asarray(close_values, dtype=np.float64)
     if len(close) < 4:
-        return {"mean_seconds": 0.0, "segments": 0}
+        return {"mean_seconds": 0.0, "median_seconds": 0.0, "max_seconds": 0.0, "segments": 0}
     returns = np.diff(np.log(close), prepend=np.log(close[0]))
     window = min(30, max(3, len(close) // 10))
     rolling_return = pd.Series(np.log(close)).diff(window).fillna(0.0)
     rolling_vol = pd.Series(returns).rolling(window, min_periods=2).std().fillna(0.0)
     threshold = np.maximum(rolling_vol * math.sqrt(window) * 0.75, 0.0015)
-    labels = np.where(rolling_return > threshold, "trend", np.where(rolling_return < -threshold, "trend", "chop"))
+    high_vol_threshold = float(rolling_vol.quantile(0.75)) if len(rolling_vol) else 0.0
+    labels = np.where(
+        rolling_return > threshold,
+        "trend",
+        np.where(
+            rolling_return < -threshold,
+            "trend",
+            np.where((rolling_vol > high_vol_threshold) & (high_vol_threshold > 0), "high_vol_chop", "chop"),
+        ),
+    )
     lengths = []
     previous = None
     count = 0
@@ -1405,9 +1935,13 @@ def trend_chop_duration_summary(close_values):
             count = 1
     if count:
         lengths.append(count)
+    label_counts = {str(label): int(count) for label, count in Counter(labels).items()}
     return {
-        "mean_seconds": float(np.mean(lengths) * 60.0) if lengths else 0.0,
+        "mean_seconds": float(np.mean(lengths) * step_seconds) if lengths else 0.0,
+        "median_seconds": float(np.median(lengths) * step_seconds) if lengths else 0.0,
+        "max_seconds": float(np.max(lengths) * step_seconds) if lengths else 0.0,
         "segments": int(len(lengths)),
+        "label_counts": dict(label_counts),
     }
 
 
@@ -1428,7 +1962,7 @@ def print_calibration_comparison(frame, minute_frame, state):
     return_distance = quantile_distance(synthetic_returns, historical.get("log_return_quantiles", {}))
     abs_return_distance = quantile_distance(synthetic_abs_returns, historical.get("abs_log_return_quantiles", {}))
     vol_distance = quantile_distance(synthetic_vol, historical.get("rolling_volatility_quantiles", {}))
-    duration_summary = trend_chop_duration_summary(closes)
+    duration_summary = trend_chop_duration_summary(closes, step_seconds=60)
     print("Historical calibration comparison")
     print(f"- calibration path: {SIM_CALIBRATION_PATH}")
     print(f"- calibration regime sampled: {state.calibration_regime}")
@@ -1449,17 +1983,31 @@ def print_calibration_comparison(frame, minute_frame, state):
         f"{shock_frequency:.4f} vs {finite_float(historical.get('large_shock_frequency_per_day')):.4f}"
     )
     historical_durations = calibration.get("regime_duration_distributions", {})
-    historical_mean_duration = np.mean(
-        [
-            finite_float(info.get("mean_seconds"))
-            for info in historical_durations.values()
-            if isinstance(info, dict)
-        ]
-        or [0.0]
+    historical_mean_values = []
+    historical_median_values = []
+    for info in historical_durations.values():
+        if not isinstance(info, dict):
+            continue
+        mean_value = finite_float(info.get("mean_seconds"), 0.0)
+        quantiles = info.get("quantiles_seconds", {})
+        median_value = finite_float(quantiles.get("0.5") if isinstance(quantiles, dict) else None, 0.0)
+        if mean_value > 0:
+            historical_mean_values.append(mean_value)
+        if median_value > 0:
+            historical_median_values.append(median_value)
+    historical_mean_duration = float(np.mean(historical_mean_values)) if historical_mean_values else 0.0
+    historical_median_duration = float(np.median(historical_median_values)) if historical_median_values else 0.0
+    print(
+        "- trend/chop duration seconds synthetic: "
+        f"segments={duration_summary['segments']} "
+        f"mean={duration_summary['mean_seconds']:.2f} "
+        f"median={duration_summary['median_seconds']:.2f} "
+        f"max={duration_summary['max_seconds']:.2f} "
+        f"labels={duration_summary.get('label_counts', {})}"
     )
     print(
-        "- trend/chop mean duration seconds synthetic vs historical: "
-        f"{duration_summary['mean_seconds']:.2f} vs {historical_mean_duration:.2f}"
+        "- trend/chop mean/median duration seconds historical: "
+        f"mean={historical_mean_duration:.2f} median={historical_median_duration:.2f}"
     )
     spread_depth = calibration.get("spread_depth_regimes", {})
     if spread_depth and len(frame):
@@ -1476,9 +2024,17 @@ def print_calibration_comparison(frame, minute_frame, state):
                 print(f"- average {column} synthetic vs historical: {synthetic_depth:.6g} vs {historical_depth:.6g}")
 
 
+def saturation_ratio(value, cap):
+    cap = abs(finite_float(cap, 0.0))
+    if cap <= 0:
+        return 0.0
+    return abs(finite_float(value, 0.0)) / cap
+
+
 def diagnostics(snapshots, one_minute_rows, state):
     frame = pd.DataFrame(snapshots)
     minute_frame = pd.DataFrame(one_minute_rows)
+    caps = effective_return_caps(SCENARIO)
     print("Synthetic market microstructure simulator")
     print(f"SYMBOL: {SYMBOL}")
     print(f"SCENARIO: {SCENARIO}")
@@ -1486,6 +2042,52 @@ def diagnostics(snapshots, one_minute_rows, state):
     print(f"RANDOM_SEED: {RANDOM_SEED}")
     print(f"SIM_CALIBRATION_PATH: {SIM_CALIBRATION_PATH if SIM_CALIBRATION else 'not loaded'}")
     print(f"SIM_FAIR_VALUE_MODE: {SIM_FAIR_VALUE_MODE}")
+    print(
+        "Return innovation: "
+        f"mode={SIM_RETURN_INNOVATION_MODE} "
+        f"student_t_df={SIM_STUDENT_T_DF:g} "
+        f"jump_probability={SIM_JUMP_MIXTURE_PROBABILITY:g} "
+        f"jump_scale={SIM_JUMP_MIXTURE_SCALE:g}"
+    )
+    print(f"Volatility persistence: {SIM_VOL_PERSISTENCE:g}")
+    print(f"Soft return limits enabled: {SIM_USE_SOFT_RETURN_LIMITS}")
+    print(
+        "Effective scenario caps: "
+        f"multiplier={caps['scenario_cap_multiplier']:.3g} "
+        f"second={caps['second']:.4%} "
+        f"minute={caps['minute']:.4%} "
+        f"close_to_close={caps['close_to_close']:.2%}"
+    )
+    print(
+        "Scenario event controls: "
+        f"global_scale={SIM_EVENT_FREQUENCY_SCALE:g} "
+        f"effective_scale={state.event_frequency_scale:g} "
+        f"event_demand_scale={state.event_demand_scale:g} "
+        f"directional_drift_scale={state.directional_drift_scale:g}"
+    )
+    print(f"Regime persistence scale: {state.regime_persistence_scale:g}")
+    print(f"Regime target duration seconds: {state.regime_target_duration_seconds:g}")
+    print(
+        "Book depth calibration: "
+        f"raw_base_level_size={BASE_LEVEL_SIZE_RAW:g} "
+        f"effective_base_level_size={BASE_LEVEL_SIZE:g} "
+        f"depth_scale={SIM_DEPTH_CALIBRATION_SCALE:g} "
+        f"historical_10bps_depth={SIM_DEPTH_HISTORICAL_10BPS:g} "
+        f"target_10bps_depth={SIM_DEPTH_TARGET_10BPS:g}"
+    )
+    if state.waveform_bands:
+        band_summary = ", ".join(
+            f"{band['name']}(period={band.get('dominant_period_seconds', 0.0):.0f}s, energy={band.get('band_energy_fraction', 0.0):.3f})"
+            for band in state.waveform_bands
+        )
+        print(f"Fair-value waveform bands loaded: {band_summary}")
+    elif state.waveform_points:
+        print("Fair-value waveform bands loaded: legacy_single_wave")
+    else:
+        print("Fair-value waveform bands loaded: none")
+    print("Recommended calibrated synthetic-training mode:")
+    print('  $env:SIM_CALIBRATION_PATH="data/simulated/calibration/SOLUSDT_kraken_sim_calibration.json"')
+    print('  $env:SIM_FAIR_VALUE_MODE="historical_wave_calibrated"')
     print(f"Active agent types: {', '.join(BotSwarm.AGENT_TYPES if SIM_ENABLE_RICH_AGENTS else BotSwarm.AGENT_TYPES[:4])}")
     print(f"Generated events: {len(state.generated_events)}")
     event_type_counts = Counter(event.event_type for event in state.generated_events)
@@ -1502,7 +2104,34 @@ def diagnostics(snapshots, one_minute_rows, state):
         print(f"Average total flow per second: {frame['total_trade_volume_10s'].mean():.6g}")
         print(f"Average trade count per second: {frame['trade_count_10s'].mean():.3f}")
         print(f"Average 10bps imbalance: {frame['order_book_imbalance_10bps'].mean():.4f}")
-        print(f"Average bid/ask depth 10bps: {frame['bid_depth_10bps'].mean():.6g} / {frame['ask_depth_10bps'].mean():.6g}")
+        avg_bid_10 = float(pd.to_numeric(frame["bid_depth_10bps"], errors="coerce").mean())
+        avg_ask_10 = float(pd.to_numeric(frame["ask_depth_10bps"], errors="coerce").mean())
+        avg_depth_10 = (avg_bid_10 + avg_ask_10) / 2.0
+        print(f"Average bid/ask depth 10bps: {avg_bid_10:.6g} / {avg_ask_10:.6g}")
+        if state.depth_historical_10bps > 0:
+            print(
+                "Realized depth calibration: "
+                f"historical_10bps={state.depth_historical_10bps:.6g} "
+                f"target_10bps={state.depth_target_10bps:.6g} "
+                f"realized_avg_10bps={avg_depth_10:.6g} "
+                f"realized/historical={safe_ratio(avg_depth_10, state.depth_historical_10bps):.3f} "
+                f"final_feedback_multiplier={state.book_depth_multiplier:.3f}"
+            )
+            if SCENARIO == "calm_chop" and avg_depth_10 > state.depth_historical_10bps * 2.0:
+                print("WARNING: calm_chop realized 10bps depth is above 2x historical.")
+            if SCENARIO == "calm_chop" and avg_depth_10 < state.depth_historical_10bps * 0.5:
+                print("WARNING: calm_chop realized 10bps depth is below 0.5x historical.")
+            if SCENARIO == "liquidity_crisis" and avg_depth_10 < state.depth_historical_10bps * 0.03:
+                print("WARNING: liquidity_crisis realized 10bps depth stayed below 0.03x historical for the full run.")
+        mid_prices = pd.to_numeric(frame["mid_price"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        max_abs_1s_return = 0.0
+        if len(mid_prices) > 1:
+            max_abs_1s_return = float(mid_prices.pct_change().abs().max() or 0.0)
+        print(
+            "Cap saturation diagnostics: "
+            f"max_abs_1s_return={max_abs_1s_return:.4%} "
+            f"ratio={saturation_ratio(max_abs_1s_return, caps['second']):.3f}"
+        )
         whale_active_pct = (pd.to_numeric(frame["hidden_whale_pressure"], errors="coerce").fillna(0.0).abs() > 0).mean()
         print(f"Seconds with whale activity: {whale_active_pct:.2%}")
         agent_counts = Counter()
@@ -1543,11 +2172,29 @@ def diagnostics(snapshots, one_minute_rows, state):
         print(f"Simulated close-to-close return: {final_return:.2%}")
         print(f"Max drawdown: {max_drawdown:.2%}")
         print(f"Max runup: {max_runup:.2%}")
+        duration_summary = trend_chop_duration_summary(closes, step_seconds=60)
+        print(
+            "Trend/chop segment diagnostics: "
+            f"segments={duration_summary['segments']} "
+            f"mean_seconds={duration_summary['mean_seconds']:.2f} "
+            f"median_seconds={duration_summary['median_seconds']:.2f} "
+            f"max_seconds={duration_summary['max_seconds']:.2f} "
+            f"labels={duration_summary.get('label_counts', {})}"
+        )
         minute_returns = pd.to_numeric(minute_frame["return_1"], errors="coerce").abs()
-        if abs(final_return) > SIM_MAX_CLOSE_TO_CLOSE_RETURN * 1.05:
-            print("WARNING: close-to-close return exceeded configured pretraining cap.")
-        if len(minute_returns) and minute_returns.max() > SIM_MAX_ABS_MINUTE_RETURN:
-            print("WARNING: at least one 1m return is larger than SIM_MAX_ABS_MINUTE_RETURN.")
+        max_abs_1m_return = float(minute_returns.max()) if len(minute_returns) else 0.0
+        close_saturation = saturation_ratio(final_return, caps["close_to_close"])
+        print(
+            "Cap saturation diagnostics: "
+            f"abs_close_to_close/effective_cap={close_saturation:.3f} "
+            f"max_abs_1m_return/effective_cap={saturation_ratio(max_abs_1m_return, caps['minute']):.3f}"
+        )
+        if close_saturation > 0.90:
+            print("WARNING: close-to-close saturation ratio is above 0.90.")
+        if caps["close_to_close"] > 0 and abs(final_return) > caps["close_to_close"] * 1.25:
+            print("WARNING: close-to-close return materially exceeded effective scenario cap.")
+        if len(minute_returns) and caps["minute"] > 0 and max_abs_1m_return > caps["minute"] * 1.25:
+            print("WARNING: at least one 1m return is materially larger than effective scenario minute cap.")
     print_calibration_comparison(frame, minute_frame, state)
     print("Hidden diagnostic columns are prefixed with hidden_ and are ignored by model feature selectors.")
     print("No trades/orders/private API behavior. Simulation only.")

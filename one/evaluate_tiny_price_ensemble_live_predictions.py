@@ -142,6 +142,22 @@ def normalize_predictions(frame):
     if "run_id" not in frame.columns:
         frame["run_id"] = "legacy_missing_run_id"
     frame["run_id"] = text(frame, "run_id").where(text(frame, "run_id").str.len() > 0, "legacy_missing_run_id")
+    for column in [
+        "move_model_id",
+        "instability_model_id",
+        "move_model_path",
+        "instability_model_path",
+        "model_pinning_status",
+        "models_pinned",
+    ]:
+        if column not in frame.columns:
+            frame[column] = "" if column != "models_pinned" else False
+    frame["move_model_id"] = text(frame, "move_model_id")
+    frame["instability_model_id"] = text(frame, "instability_model_id")
+    frame["move_model_path"] = text(frame, "move_model_path")
+    frame["instability_model_path"] = text(frame, "instability_model_path")
+    frame["model_pinning_status"] = text(frame, "model_pinning_status", "unknown")
+    frame["models_pinned"] = truthy_series(frame, "models_pinned", False)
     if "active_move_confidence_threshold" not in frame.columns:
         frame["active_move_confidence_threshold"] = numeric(frame, "move_confidence_threshold", np.nan)
     else:
@@ -157,6 +173,20 @@ def normalize_predictions(frame):
     if "regression_enabled" not in frame.columns:
         frame["regression_enabled"] = False
     frame["regression_enabled"] = truthy_series(frame, "regression_enabled", False)
+    if "active_allowed_sides" not in frame.columns:
+        frame["active_allowed_sides"] = text(frame, "allowed_sides", "both")
+    else:
+        frame["active_allowed_sides"] = text(frame, "active_allowed_sides").where(
+            text(frame, "active_allowed_sides").str.len() > 0,
+            text(frame, "allowed_sides", "both"),
+        )
+    frame["active_allowed_sides"] = (
+        frame["active_allowed_sides"]
+        .str.strip()
+        .str.lower()
+        .where(lambda values: values.isin(["long", "short", "both"]), "both")
+    )
+    frame["allowed_sides"] = frame["active_allowed_sides"]
     move_hash = text(frame, "move_before_adverse_schema_hash")
     instability_hash = text(frame, "instability_schema_hash")
     direction_hash = text(frame, "direction_model_schema_hash")
@@ -198,7 +228,10 @@ def normalize_predictions(frame):
         frame["optional_direction_ignored_reason"] = ""
     if "optional_regression_ignored_reason" not in frame.columns:
         frame["optional_regression_ignored_reason"] = ""
-    frame = frame.sort_values("timestamp").drop_duplicates(["timestamp", "symbol", "primary_venue", "run_id"], keep="last")
+    frame = frame.sort_values("timestamp").drop_duplicates(
+        ["timestamp", "symbol", "primary_venue", "run_id", "move_model_id", "instability_model_id"],
+        keep="last",
+    )
     return frame.reset_index(drop=True)
 
 
@@ -467,6 +500,7 @@ def summarize(predictions, evaluated, attach_stats):
         "prediction_path": str(PREDICTIONS_PATH),
         "snapshot_path": str(SNAPSHOT_PATH),
         "horizon_seconds": HORIZON_SECONDS,
+        "allowed_sides_values": ",".join(sorted(set(text(predictions, "active_allowed_sides", "both")))) if len(predictions) else "",
         "total_rows": total_rows,
         "evaluated_rows": evaluated_rows,
         "paper_signal_rows": int(len(signal_rows)),
@@ -510,8 +544,11 @@ def summarize_by_run(predictions, evaluated):
 
     group_columns = [
         "run_id",
+        "move_model_id",
+        "instability_model_id",
         "active_move_confidence_threshold",
         "active_instability_threshold",
+        "active_allowed_sides",
         "regression_enabled",
     ]
     evaluated_lookup = evaluated.copy() if len(evaluated) else pd.DataFrame()
@@ -544,8 +581,15 @@ def summarize_by_run(predictions, evaluated):
                 "symbol": SYMBOL,
                 "primary_venue": PRIMARY_VENUE,
                 "run_id": str(group_key.get("run_id", "")),
+                "move_model_id": str(group_key.get("move_model_id", "")),
+                "instability_model_id": str(group_key.get("instability_model_id", "")),
+                "move_model_path": text(group, "move_model_path").iloc[-1] if "move_model_path" in group.columns and len(group) else "",
+                "instability_model_path": text(group, "instability_model_path").iloc[-1] if "instability_model_path" in group.columns and len(group) else "",
+                "model_pinning_status": text(group, "model_pinning_status").iloc[-1] if "model_pinning_status" in group.columns and len(group) else "unknown",
+                "models_pinned": bool(truthy_series(group, "models_pinned", False).all()) if len(group) else False,
                 "active_move_confidence_threshold": group_key.get("active_move_confidence_threshold", np.nan),
                 "active_instability_threshold": group_key.get("active_instability_threshold", np.nan),
+                "active_allowed_sides": group_key.get("active_allowed_sides", "both"),
                 "regression_enabled": bool(group_key.get("regression_enabled", False)),
                 "total_rows": int(len(group)),
                 "evaluated_rows": int(len(matched)),
@@ -588,6 +632,18 @@ def side_specific_excursions(frame, direction):
     return mfe, mae
 
 
+def allowed_side_mask(directions, allowed_sides):
+    directions = pd.to_numeric(directions, errors="coerce").fillna(0).astype(int)
+    allowed_sides = pd.Series(allowed_sides, index=directions.index if not hasattr(allowed_sides, "index") else allowed_sides.index)
+    allowed_sides = allowed_sides.fillna("both").astype(str).str.strip().str.lower()
+    allowed_sides = allowed_sides.where(allowed_sides.isin(["long", "short", "both"]), "both")
+    return (
+        (allowed_sides == "both")
+        | ((allowed_sides == "long") & (directions > 0))
+        | ((allowed_sides == "short") & (directions < 0))
+    )
+
+
 def threshold_sensitivity(predictions, evaluated):
     if len(predictions) == 0:
         return pd.DataFrame()
@@ -598,6 +654,7 @@ def threshold_sensitivity(predictions, evaluated):
     instability_probability = numeric(predictions, "instability_probability")
     move_direction = numeric(predictions, "move_before_adverse_direction", 0).fillna(0).astype(int)
     stale = text(predictions, "snapshot_freshness").str.lower() != "fresh"
+    side_allowed = allowed_side_mask(move_direction, text(predictions, "active_allowed_sides", "both"))
 
     has_required_values = (
         np.isfinite(move_confidence.to_numpy(dtype=np.float64))
@@ -617,7 +674,8 @@ def threshold_sensitivity(predictions, evaluated):
                 & (move_confidence.to_numpy(dtype=np.float64) >= move_threshold)
                 & (instability_probability.to_numpy(dtype=np.float64) < instability_threshold)
             )
-            kept_mask = gate & (~stale.to_numpy(dtype=bool))
+            side_blocked_rows_excluded = int((gate & (~side_allowed.to_numpy(dtype=bool))).sum())
+            kept_mask = gate & side_allowed.to_numpy(dtype=bool) & (~stale.to_numpy(dtype=bool))
             kept_predictions = predictions.loc[kept_mask].copy()
             kept_timestamps = set(pd.to_numeric(kept_predictions["timestamp"], errors="coerce").dropna().astype("int64").tolist())
 
@@ -685,6 +743,7 @@ def threshold_sensitivity(predictions, evaluated):
                     "average_mfe_bps": avg_mfe,
                     "average_mae_bps": avg_mae,
                     "stale_rows_excluded": stale_rows_excluded,
+                    "side_blocked_rows_excluded": side_blocked_rows_excluded,
                     "missing_future_rows_excluded": missing_future_rows_excluded,
                 }
             )
@@ -856,8 +915,11 @@ def side_regime_diagnostics(predictions, evaluated):
     if len(evaluated):
         group_columns = [
             "run_id",
+            "move_model_id",
+            "instability_model_id",
             "active_move_confidence_threshold",
             "active_instability_threshold",
+            "active_allowed_sides",
             "regression_enabled",
         ]
         for group_values, group in evaluated.groupby(group_columns, dropna=False, sort=False):
@@ -883,6 +945,10 @@ def side_regime_diagnostics(predictions, evaluated):
         evaluated["move_before_adverse_direction_for_gate"] = numeric(evaluated, "move_before_adverse_direction", 0).fillna(0).astype(int)
         stale = text(evaluated, "snapshot_freshness").str.lower() != "fresh"
         required_schema_ok = truthy_series(evaluated, "required_schema_match", False)
+        side_allowed = allowed_side_mask(
+            evaluated["move_before_adverse_direction_for_gate"],
+            text(evaluated, "active_allowed_sides", "both"),
+        )
         for move_threshold in MOVE_CONFIDENCE_THRESHOLDS:
             for instability_threshold in INSTABILITY_THRESHOLDS:
                 base_gate = (
@@ -891,6 +957,7 @@ def side_regime_diagnostics(predictions, evaluated):
                     & (numeric(evaluated, "move_before_adverse_confidence") >= move_threshold)
                     & (numeric(evaluated, "instability_probability") < instability_threshold)
                     & (numeric(evaluated, "move_before_adverse_direction", 0).fillna(0).astype(int) != 0)
+                    & side_allowed
                 )
                 gated = evaluated.loc[base_gate].copy()
                 gated = add_hypothetical_strategy_columns(gated, "move_before_adverse_direction_for_gate") if len(gated) else gated
@@ -973,6 +1040,7 @@ def print_threshold_sensitivity(frame):
         )
         print(
             f" stale_excluded={int(row['stale_rows_excluded'])} "
+            f"side_blocked={int(row.get('side_blocked_rows_excluded', 0))} "
             f"missing_future_excluded={int(row['missing_future_rows_excluded'])}"
         )
     print(f"Threshold sensitivity output: {THRESHOLD_SENSITIVITY_PATH}")
@@ -994,6 +1062,7 @@ def print_summary(summary, no_trade_reasons):
     print("")
     print("Summary")
     print(f"- total rows: {summary['total_rows']}")
+    print(f"- allowed sides values: {summary.get('allowed_sides_values', '')}")
     print(f"- evaluated rows with realized {HORIZON_SECONDS}s outcome: {summary['evaluated_rows']}")
     print(f"- paper signal rows: {summary['paper_signal_rows']}")
     print(f"- long count: {summary['long_count']}")
@@ -1052,8 +1121,12 @@ def print_grouped_summary(grouped):
         avg_return = row["average_realized_30s_strategy_return_bps"]
         print(
             f"- run_id={row['run_id']} "
+            f"move_model={str(row.get('move_model_id', ''))[:18]} "
+            f"inst_model={str(row.get('instability_model_id', ''))[:18]} "
+            f"pinning={row.get('model_pinning_status', 'unknown')} "
             f"move={row['active_move_confidence_threshold']} "
             f"instability={row['active_instability_threshold']} "
+            f"sides={row.get('active_allowed_sides', 'both')} "
             f"regression={row['regression_enabled']} "
             f"rows={int(row['total_rows'])} "
             f"eval={int(row['evaluated_rows'])} "
@@ -1062,8 +1135,12 @@ def print_grouped_summary(grouped):
             f"short={int(row['short_count'])} "
             f"sign_acc={sign_accuracy:.2%}" if np.isfinite(sign_accuracy) else
             f"- run_id={row['run_id']} "
+            f"move_model={str(row.get('move_model_id', ''))[:18]} "
+            f"inst_model={str(row.get('instability_model_id', ''))[:18]} "
+            f"pinning={row.get('model_pinning_status', 'unknown')} "
             f"move={row['active_move_confidence_threshold']} "
             f"instability={row['active_instability_threshold']} "
+            f"sides={row.get('active_allowed_sides', 'both')} "
             f"regression={row['regression_enabled']} "
             f"rows={int(row['total_rows'])} "
             f"eval={int(row['evaluated_rows'])} "

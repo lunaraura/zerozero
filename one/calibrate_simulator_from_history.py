@@ -252,27 +252,99 @@ def classify_regimes(close, returns, step_seconds):
     return labels, rolling_return, rolling_volatility
 
 
-def build_low_frequency_wave(close):
-    log_close = pd.Series(np.log(np.asarray(close, dtype=np.float64)))
-    smooth_window = max(24, min(576, len(log_close) // 20))
-    smooth = log_close.rolling(smooth_window, min_periods=max(3, smooth_window // 4)).mean()
-    smooth = smooth.interpolate().bfill().ffill()
-    detrended = smooth - smooth.rolling(max(smooth_window * 4, 48), min_periods=3).mean().interpolate().bfill().ffill()
-    values = detrended.replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy(dtype=np.float64)
+def sample_wave_payload(values, step_seconds, band_name, frequency_bounds_hz=None, fft_coefficients=None):
+    values = np.asarray(values, dtype=np.float64)
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
     std = float(np.std(values))
     normalized = values / std if std > 1e-12 else values
-    sample_count = min(512, max(64, len(normalized)))
-    positions = np.linspace(0, len(normalized) - 1, sample_count)
-    sampled = np.interp(positions, np.arange(len(normalized)), normalized)
+    sample_count = min(512, max(64, len(normalized))) if len(normalized) else 0
+    if sample_count:
+        positions = np.linspace(0, len(normalized) - 1, sample_count)
+        sampled = np.interp(positions, np.arange(len(normalized)), normalized)
+    else:
+        sampled = np.asarray([], dtype=np.float64)
     sampled = np.clip(sampled, -3.0, 3.0)
     drift = np.diff(sampled)
+    dominant_frequency_hz = 0.0
+    dominant_period_seconds = 0.0
+    dominant_phase_radians = 0.0
+    band_energy = float(np.sum(np.square(values)))
+    if fft_coefficients is not None and frequency_bounds_hz is not None:
+        frequencies, coefficients, mask = fft_coefficients
+        masked_indices = np.where(mask & (frequencies > 0))[0]
+        if len(masked_indices):
+            strongest_index = masked_indices[np.argmax(np.abs(coefficients[masked_indices]))]
+            dominant_frequency_hz = float(frequencies[strongest_index])
+            dominant_period_seconds = float(1.0 / dominant_frequency_hz) if dominant_frequency_hz > 0 else 0.0
+            dominant_phase_radians = float(np.angle(coefficients[strongest_index]))
     return {
+        "band_name": band_name,
+        "method": "fft_irfft_log_price_band",
         "normalized_points": [float(value) for value in sampled],
         "point_count": int(sample_count),
-        "source_smooth_window_rows": int(smooth_window),
+        "frequency_bounds_hz": [float(item) if item is not None else None for item in (frequency_bounds_hz or [None, None])],
+        "period_bounds_seconds": [
+            float(1.0 / frequency_bounds_hz[1]) if frequency_bounds_hz and frequency_bounds_hz[1] else None,
+            float(1.0 / frequency_bounds_hz[0]) if frequency_bounds_hz and frequency_bounds_hz[0] else None,
+        ],
         "wave_std_log_price": std,
-        "wave_drift_scale_per_second": float(np.clip(np.std(drift) * 0.00008, 0.000005, 0.00008)),
+        "wave_energy": band_energy,
+        "dominant_frequency_hz": dominant_frequency_hz,
+        "dominant_period_seconds": dominant_period_seconds,
+        "dominant_phase_radians": dominant_phase_radians,
+        "wave_drift_scale_per_second": float(np.clip(np.std(drift) * 0.00008 if len(drift) else 0.0, 0.0, 0.00008)),
     }
+
+
+def build_fft_fair_value_waveforms(close, step_seconds):
+    log_close = np.log(np.asarray(close, dtype=np.float64))
+    log_close = np.nan_to_num(log_close, nan=np.nanmedian(log_close), posinf=np.nanmedian(log_close), neginf=np.nanmedian(log_close))
+    if len(log_close) < 8:
+        empty = sample_wave_payload(np.zeros(max(len(log_close), 1)), step_seconds, "empty")
+        return {"session": empty, "low": empty, "mid": empty, "high": empty}
+
+    index = np.arange(len(log_close), dtype=np.float64)
+    slope, intercept = np.polyfit(index, log_close, 1)
+    detrended = log_close - (slope * index + intercept)
+    detrended = detrended - float(np.mean(detrended))
+    coefficients = np.fft.rfft(detrended)
+    frequencies = np.fft.rfftfreq(len(detrended), d=max(float(step_seconds), 1.0))
+    total_energy = float(np.sum(np.square(detrended)))
+
+    band_definitions = {
+        "session": (0.0, 1.0 / 7200.0),
+        "low": (1.0 / 7200.0, 1.0 / 1800.0),
+        "mid": (1.0 / 1800.0, 1.0 / 300.0),
+        "high": (1.0 / 300.0, 1.0 / 60.0),
+    }
+    waveforms = {}
+    for name, (low_hz, high_hz) in band_definitions.items():
+        if low_hz <= 0:
+            mask = (frequencies > 0) & (frequencies <= high_hz)
+        else:
+            mask = (frequencies > low_hz) & (frequencies <= high_hz)
+        band_coefficients = np.zeros_like(coefficients)
+        band_coefficients[mask] = coefficients[mask]
+        reconstructed = np.fft.irfft(band_coefficients, n=len(detrended))
+        payload = sample_wave_payload(
+            reconstructed,
+            step_seconds,
+            name,
+            frequency_bounds_hz=[low_hz, high_hz],
+            fft_coefficients=(frequencies, coefficients, mask),
+        )
+        payload["band_energy_fraction"] = float(payload["wave_energy"] / max(total_energy, 1e-12))
+        payload["source_step_seconds"] = int(step_seconds)
+        payload["source_point_count"] = int(len(close))
+        waveforms[name] = payload
+    return waveforms
+
+
+def build_low_frequency_wave(close, step_seconds=300):
+    waveforms = build_fft_fair_value_waveforms(close, step_seconds)
+    low = dict(waveforms.get("low") or waveforms.get("session") or {})
+    low["legacy_compatibility_note"] = "Legacy fair_value_waveform points mirror fair_value_waveforms.low."
+    return low
 
 
 def calibration_payload(frame, used_paths):
@@ -421,6 +493,10 @@ def calibration_payload(frame, used_paths):
         "macro_risk": [-float(np.clip(abs(drawdown_min) * 0.8, 0.03, 0.30)), float(np.clip(runup_max * 0.6, 0.03, 0.30))],
     }
 
+    fair_value_waveforms = build_fft_fair_value_waveforms(close, step_seconds)
+    legacy_low_waveform = dict(fair_value_waveforms.get("low") or fair_value_waveforms.get("session") or {})
+    legacy_low_waveform["legacy_compatibility_note"] = "Legacy fair_value_waveform points mirror fair_value_waveforms.low."
+
     payload = {
         "schema_version": 1,
         "symbol": SYMBOL,
@@ -458,7 +534,12 @@ def calibration_payload(frame, used_paths):
         },
         "volume_trade_count_regimes": volume_summary,
         "spread_depth_regimes": microstructure_summary,
-        "fair_value_waveform": build_low_frequency_wave(close),
+        "fair_value_waveform": legacy_low_waveform,
+        "fair_value_waveforms": fair_value_waveforms,
+        "fair_value_waveform_session": fair_value_waveforms.get("session", {}),
+        "fair_value_waveform_low": fair_value_waveforms.get("low", {}),
+        "fair_value_waveform_mid": fair_value_waveforms.get("mid", {}),
+        "fair_value_waveform_high": fair_value_waveforms.get("high", {}),
         "simulator_parameters": {
             "regime_probabilities": regime_probabilities,
             "regime_duration_distributions": {

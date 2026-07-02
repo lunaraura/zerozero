@@ -193,6 +193,12 @@ def build_current_features(frame, artifact):
         )
     if "regime_context_features" in feature_groups:
         output = add_btc_lead_lag_context(output)
+    missing_feature_columns = [column for column in artifact["feature_columns"] if column not in output.columns]
+    output.attrs["missing_model_feature_columns_before_fill"] = missing_feature_columns
+    output.attrs["computed_feature_columns_before_fill"] = [
+        column for column in output.columns if str(column).startswith("feature_")
+    ]
+    output.attrs["computed_feature_count_before_fill"] = len(output.attrs["computed_feature_columns_before_fill"])
     for column in artifact["feature_columns"]:
         if column not in output.columns:
             output[column] = 0.0

@@ -84,6 +84,9 @@ PRICE_TINY_TARGET_HORIZONS_SECONDS = [
     for value in os.getenv("PRICE_TINY_TARGET_HORIZONS_SECONDS", "30,45,60").split(",")
     if value.strip()
 ]
+PRICE_TINY_ALLOW_FAILED_REPLAY_VALIDATION = os.getenv(
+    "PRICE_TINY_ALLOW_FAILED_REPLAY_VALIDATION", "false"
+).strip().lower() in {"1", "true", "yes", "y"}
 
 if not OUTPUT_DIR.is_absolute():
     OUTPUT_DIR = PROJECT_ROOT / OUTPUT_DIR
@@ -98,7 +101,32 @@ CROSS_VENUE_PATH = OUTPUT_DIR / f"{SYMBOL}_cross_venue_features.csv"
 BTC_CONTEXT_PATH = VENUE_DIR / f"{BTC_CONTEXT_SYMBOL}_10s_flow.csv"
 LATEST_OUTPUT_PATH = VENUE_DIR / f"{SYMBOL}_tiny_price_training_rows.csv"
 LATEST_METADATA_PATH = VENUE_DIR / f"{SYMBOL}_tiny_price_training_rows_latest.json"
+REPLAY_QUALITY_PATH = VENUE_DIR / f"{SYMBOL}_replay_quality.json"
 BTC_CONTEXT_CACHE = None
+
+
+def enforce_replay_quality_gate():
+    if not PRIMARY_VENUE.startswith("replayed"):
+        return
+    if PRICE_TINY_ALLOW_FAILED_REPLAY_VALIDATION:
+        print("WARNING: PRICE_TINY_ALLOW_FAILED_REPLAY_VALIDATION=true; replay quality gate is bypassed.")
+        return
+    if not REPLAY_QUALITY_PATH.exists():
+        raise SystemExit(
+            "Replay quality marker is missing. Refusing to build tiny-price training rows from replay output. "
+            f"Expected: {REPLAY_QUALITY_PATH}. Re-run replay_market_from_trades.py first, or set "
+            "PRICE_TINY_ALLOW_FAILED_REPLAY_VALIDATION=true for research inspection only."
+        )
+    try:
+        payload = json.loads(REPLAY_QUALITY_PATH.read_text(encoding="utf-8"))
+    except Exception as error:
+        raise SystemExit(f"Could not read replay quality marker {REPLAY_QUALITY_PATH}: {error}") from error
+    if not bool(payload.get("validation_pass", False)):
+        raise SystemExit(
+            "Replay validation failed, so tiny-price training rows will not be built from this replay output. "
+            f"Marker: {REPLAY_QUALITY_PATH}. Message: {payload.get('message', '')}. "
+            "Set PRICE_TINY_ALLOW_FAILED_REPLAY_VALIDATION=true only for debugging, not training summaries."
+        )
 
 
 def parse_target_spec(name, fallback_horizon):
@@ -1316,6 +1344,7 @@ def build_rows(frame):
 
 
 def main():
+    enforce_replay_quality_gate()
     raw = read_csv(INPUT_PATH)
     frame = normalize_input(raw) if len(raw) else pd.DataFrame()
     if PRICE_TINY_BUILD_MAX_ROWS > 0 and len(frame) > PRICE_TINY_BUILD_MAX_ROWS:
