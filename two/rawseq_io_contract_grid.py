@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import os
 import re
+import sys
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,7 +38,14 @@ OUTPUT_DIR_TEXT = os.getenv(
 BASE_SOURCE_COLUMNS = ["timestamp", "price"]
 OPTIONAL_SOURCE_COLUMNS = ["time", "predicted_side"]
 SUPPORTED_INPUT_FEATURES = {"return", "ma_distance", "ma_slope"}
-SUPPORTED_OUTPUT_LABELS = {"future_return_path"}
+ALLOWED_OUTPUT_LABELS = {
+    "future_return_path",
+    "future_high_from_now_bps_path",
+    "future_low_from_now_bps_path",
+    "future_range_envelope_path",
+    "barrier_hit_levels",
+    "tp_before_stop_by_rung",
+}
 
 
 def now_stamp() -> str:
@@ -79,6 +88,20 @@ def parse_hiddens(text: str) -> list[str]:
     return values
 
 
+def load_label_registry(seq_len: int) -> dict[str, dict[str, Any]]:
+    path = PROJECT_ROOT / "scripts" / "tiny" / "rawseq_feature_label_registry.py"
+    spec = importlib.util.spec_from_file_location("rawseq_feature_label_registry_for_grid", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"Could not import rawseq feature/label registry: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    labels = {}
+    for definition in module.output_labels(seq_len):
+        labels[definition.label_name] = definition.row()
+    return labels
+
+
 def safe_slug(text: str) -> str:
     text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text.strip())
     text = re.sub(r"_+", "_", text).strip("._")
@@ -92,11 +115,20 @@ def required_columns(input_feature: str) -> list[str]:
     return columns
 
 
-def support_status(input_feature: str, ma_window: str, output_label: str, hidden: str, seq_len: int) -> tuple[str, str]:
+def support_status(
+    input_feature: str,
+    ma_window: str,
+    output_label: str,
+    hidden: str,
+    seq_len: int,
+    label_registry: dict[str, dict[str, Any]],
+) -> tuple[str, str]:
     reasons: list[str] = []
     if input_feature not in SUPPORTED_INPUT_FEATURES:
         reasons.append(f"unsupported_input_feature={input_feature}")
-    if output_label not in SUPPORTED_OUTPUT_LABELS:
+    if output_label not in ALLOWED_OUTPUT_LABELS:
+        reasons.append(f"output_label_not_allowed={output_label}")
+    if output_label not in label_registry:
         reasons.append(f"unsupported_output_label={output_label}")
     if input_feature in {"ma_distance", "ma_slope"} and not ma_window:
         reasons.append("ma_window_required")
@@ -109,6 +141,18 @@ def support_status(input_feature: str, ma_window: str, output_label: str, hidden
         reasons.append(f"unsupported_seq_len={seq_len}")
     unsupported = [reason for reason in reasons if reason != "ma_window_ignored_for_return"]
     return ("unsupported" if unsupported else "supported"), ";".join(reasons)
+
+
+def label_meta(label_registry: dict[str, dict[str, Any]], output_label: str) -> dict[str, Any]:
+    row = label_registry.get(output_label, {})
+    return {
+        "task_type": row.get("task_type", ""),
+        "output_dim": row.get("output_dim", ""),
+        "required_horizon_buckets": row.get("required_horizon_buckets", ""),
+        "label_required_columns": str(row.get("required_source_columns", "")).replace(",", ";"),
+        "compatible_policies": str(row.get("compatible_policies", "")).replace(",", ";"),
+        "leakage_warning": row.get("leakage_warning", ""),
+    }
 
 
 def contract_slug(
@@ -152,6 +196,7 @@ def build_rows() -> list[dict[str, Any]]:
     ma_windows = parse_csv_ints(MA_WINDOWS, "RAWSEQ_IO_MA_WINDOWS")
     hiddens = parse_hiddens(HIDDENS)
     output_labels = parse_csv_strings(OUTPUT_LABELS)
+    label_registry = load_label_registry(max(seq_lens))
 
     rows: list[dict[str, Any]] = []
     for seq_len in seq_lens:
@@ -166,7 +211,8 @@ def build_rows() -> list[dict[str, Any]]:
                     for ma_window in feature_ma_windows:
                         for hidden in hiddens:
                             for output_label in output_labels:
-                                status, reason = support_status(input_feature, ma_window, output_label, hidden, seq_len)
+                                status, reason = support_status(input_feature, ma_window, output_label, hidden, seq_len, label_registry)
+                                meta = label_meta(label_registry, output_label)
                                 rows.append(
                                     {
                                         "contract_slug": contract_slug(
@@ -193,6 +239,12 @@ def build_rows() -> list[dict[str, Any]]:
                                         "ma_window": ma_window,
                                         "hidden": hidden,
                                         "output_label": output_label,
+                                        "task_type": meta["task_type"],
+                                        "output_dim": meta["output_dim"],
+                                        "required_horizon_buckets": meta["required_horizon_buckets"],
+                                        "label_required_columns": meta["label_required_columns"],
+                                        "compatible_policies": meta["compatible_policies"],
+                                        "leakage_warning": meta["leakage_warning"],
                                         "input_window_seconds": BUCKET_SECONDS * seq_len * input_stride,
                                         "output_window_seconds": BUCKET_SECONDS * seq_len * output_stride,
                                         "required_source_columns": ";".join(required_columns(input_feature)),
@@ -213,9 +265,11 @@ def write_text(path: Path, rows: list[dict[str, Any]]) -> None:
     supported = [row for row in rows if row["support_status"] == "supported"]
     unsupported = [row for row in rows if row["support_status"] != "supported"]
     by_feature: dict[str, int] = {}
+    by_label: dict[str, int] = {}
     by_scale: dict[str, int] = {}
     for row in rows:
         by_feature[row["input_feature"]] = by_feature.get(row["input_feature"], 0) + 1
+        by_label[row["output_label"]] = by_label.get(row["output_label"], 0) + 1
         key = f"is{row['input_stride']}_os{row['output_stride']}"
         by_scale[key] = by_scale.get(key, 0) + 1
 
@@ -241,6 +295,10 @@ def write_text(path: Path, rows: list[dict[str, Any]]) -> None:
     ]
     for key in sorted(by_feature):
         lines.append(f"  {key}: {by_feature[key]}")
+    lines.append("")
+    lines.append("Rows by output label:")
+    for key in sorted(by_label):
+        lines.append(f"  {key}: {by_label[key]}")
     lines.append("")
     lines.append("Rows by stride pair:")
     for key in sorted(by_scale):

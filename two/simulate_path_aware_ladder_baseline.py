@@ -21,6 +21,8 @@ OUTPUT_ROOT = Path(os.getenv("LADDER_OUTPUT_DIR", PROJECT_ROOT / "data" / "resea
 PRICE_COLUMN_ENV = os.getenv("LADDER_PRICE_COLUMN", "").strip()
 BUCKET_SECONDS = int(float(os.getenv("LADDER_BUCKET_SECONDS", "10")))
 ANCHOR_MODE = os.getenv("LADDER_ANCHOR_MODE", "ema").strip().lower()
+ENTRY_ANCHOR_SOURCE = os.getenv("LADDER_ENTRY_ANCHOR_SOURCE", "frozen_rebalance_anchor").strip().lower()
+RECENTER_MODE = os.getenv("LADDER_RECENTER_MODE", "fixed_interval").strip().lower()
 ANCHOR_WINDOWS = [int(float(x)) for x in os.getenv("LADDER_ANCHOR_WINDOWS", "60,150,300").split(",") if x.strip()]
 VOL_WINDOWS = [int(float(x)) for x in os.getenv("LADDER_VOL_WINDOWS", "60,150,300").split(",") if x.strip()]
 SPACING_MODE = os.getenv("LADDER_SPACING_MODE", "volatility_scaled").strip().lower()
@@ -51,6 +53,18 @@ REBALANCE_INTERVAL_BUCKETS = int(float(os.getenv("LADDER_REBALANCE_INTERVAL_BUCK
 REBALANCE_MODE = os.getenv("LADDER_REBALANCE_MODE", "fixed_interval").strip().lower()
 REBALANCE_ANCHOR_DRIFT_BPS = float(os.getenv("LADDER_REBALANCE_ANCHOR_DRIFT_BPS", "20"))
 REBALANCE_VOL_CHANGE_FRACTION = float(os.getenv("LADDER_REBALANCE_VOL_CHANGE_FRACTION", "0.25"))
+TIMEOUT_EXIT_MODE = os.getenv("LADDER_TIMEOUT_EXIT_MODE", "market").strip().lower()
+MIN_TAKE_PROFIT_BPS = float(os.getenv("LADDER_MIN_TAKE_PROFIT_BPS", "0"))
+RUNG_CONSUMPTION_MODE = os.getenv("LADDER_RUNG_CONSUMPTION_MODE", "consume_until_rebalance").strip().lower()
+RUNG_REUSE_COOLDOWN_BUCKETS = int(float(os.getenv("LADDER_RUNG_REUSE_COOLDOWN_BUCKETS", "180")))
+EMERGENCY_REBALANCE_MODE = os.getenv("LADDER_EMERGENCY_REBALANCE_MODE", "off").strip().lower()
+EMERGENCY_REMAINING_RUNG_THRESHOLD = int(float(os.getenv("LADDER_EMERGENCY_REMAINING_RUNG_THRESHOLD", "1")))
+EMERGENCY_MIN_INTERVAL_BUCKETS = int(float(os.getenv("LADDER_EMERGENCY_MIN_INTERVAL_BUCKETS", "60")))
+EMERGENCY_MAX_PER_GLOBAL_INTERVAL = int(float(os.getenv("LADDER_EMERGENCY_MAX_PER_GLOBAL_INTERVAL", "1")))
+EMERGENCY_ANCHOR_SLOPE_BPS = float(os.getenv("LADDER_EMERGENCY_ANCHOR_SLOPE_BPS", "0"))
+EMERGENCY_ANCHOR_ACCEL_BPS = float(os.getenv("LADDER_EMERGENCY_ANCHOR_ACCEL_BPS", "0"))
+EMERGENCY_DISABLE_WHEN_INVENTORY_GE_ENV = os.getenv("LADDER_EMERGENCY_DISABLE_WHEN_INVENTORY_GE", "").strip()
+EMERGENCY_DISABLE_WHEN_DRAWDOWN_BPS = float(os.getenv("LADDER_EMERGENCY_DISABLE_WHEN_DRAWDOWN_BPS", "120"))
 MAX_DRAWDOWN_BPS = os.getenv("LADDER_MAX_DRAWDOWN_BPS", "").strip()
 MAX_DRAWDOWN_BPS = float(MAX_DRAWDOWN_BPS) if MAX_DRAWDOWN_BPS else math.nan
 RANGE_BREAK_BUFFER_BPS = float(os.getenv("LADDER_RANGE_BREAK_BUFFER_BPS", "20"))
@@ -262,10 +276,14 @@ def precompute_indicators(frame: pd.DataFrame) -> dict[str, np.ndarray]:
     ret_series = pd.Series(returns)
     indicators = {}
     for window in sorted(set(ANCHOR_WINDOWS)):
+        indicators[f"anchor_rolling_ma_{window}"] = series.rolling(window, min_periods=window).mean().to_numpy(dtype=np.float64)
+        indicators[f"anchor_ema_{window}"] = series.ewm(span=window, adjust=False, min_periods=window).mean().to_numpy(dtype=np.float64)
         if ANCHOR_MODE == "rolling_ma":
-            indicators[f"anchor_{window}"] = series.rolling(window, min_periods=window).mean().to_numpy(dtype=np.float64)
-        elif ANCHOR_MODE == "ema":
-            indicators[f"anchor_{window}"] = series.ewm(span=window, adjust=False, min_periods=window).mean().to_numpy(dtype=np.float64)
+            indicators[f"anchor_{window}"] = indicators[f"anchor_rolling_ma_{window}"]
+        elif ANCHOR_MODE in {"ema", "frozen_rebalance_anchor"}:
+            indicators[f"anchor_{window}"] = indicators[f"anchor_ema_{window}"]
+        elif ANCHOR_MODE == "session_anchor":
+            indicators[f"anchor_{window}"] = np.full(len(price), price[0] if len(price) else math.nan, dtype=np.float64)
         else:
             raise SystemExit(f"Unsupported LADDER_ANCHOR_MODE={ANCHOR_MODE}")
     for window in sorted(set(VOL_WINDOWS)):
@@ -331,7 +349,15 @@ def simulate_config(
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
     price = frame["price"].to_numpy(dtype=np.float64)
     timestamp = frame["timestamp"].to_numpy(dtype=np.float64)
-    anchor = indicators[f"anchor_{contract['anchor_window']}"]
+    anchor_mode = str(contract.get("anchor_mode", ANCHOR_MODE)).strip().lower()
+    if anchor_mode == "rolling_ma":
+        anchor = indicators[f"anchor_rolling_ma_{contract['anchor_window']}"]
+    elif anchor_mode in {"ema", "frozen_rebalance_anchor"}:
+        anchor = indicators[f"anchor_ema_{contract['anchor_window']}"]
+    elif anchor_mode == "session_anchor":
+        anchor = np.full(len(price), price[0] if len(price) else math.nan, dtype=np.float64)
+    else:
+        raise SystemExit(f"Unsupported LADDER_ANCHOR_MODE={anchor_mode}")
     vol = indicators[f"vol_{contract['vol_window']}"]
     if SPACING_MODE != "volatility_scaled":
         raise SystemExit(f"Unsupported LADDER_SPACING_MODE={SPACING_MODE}")
@@ -340,10 +366,40 @@ def simulate_config(
     spacing_vol_mult = float(contract.get("spacing_vol_mult", contract.get("vol_mult", 1.0)))
     stop_loss_vol_mult = float(contract.get("stop_loss_vol_mult", 8.0))
     take_profit_spacing_mult = float(contract.get("take_profit_spacing_mult", contract.get("take_profit_mult", 1.0)))
+    min_take_profit_bps = float(contract.get("min_take_profit_bps", MIN_TAKE_PROFIT_BPS))
     max_open_units = int(contract.get("max_open_units", MAX_OPEN_UNITS))
     min_stop_floor_bps = float(contract.get("min_stop_floor_bps", contract.get("stop_loss_bps", 80.0)))
     max_hold_buckets = int(contract.get("max_hold_buckets", 180))
+    timeout_exit_mode = str(contract.get("timeout_exit_mode", TIMEOUT_EXIT_MODE)).strip().lower()
+    allowed_timeout_modes = {"market", "breakeven_only", "trend_invalid_only", "disable_timeout"}
+    if timeout_exit_mode not in allowed_timeout_modes:
+        raise SystemExit(f"Unsupported LADDER_TIMEOUT_EXIT_MODE={timeout_exit_mode}")
     force_flat = bool(contract.get("force_flat_at_end", FORCE_FLAT_AT_END))
+    entry_anchor_source = str(contract.get("entry_anchor_source", ENTRY_ANCHOR_SOURCE)).strip().lower()
+    recenter_mode = str(contract.get("recenter_mode", RECENTER_MODE)).strip().lower()
+    allowed_entry_anchor_sources = {"current_anchor", "frozen_rebalance_anchor"}
+    allowed_recenter_modes = {"fixed_interval", "anchor_drift_trigger", "never_while_inventory_open", "interval_only_when_flat"}
+    if entry_anchor_source not in allowed_entry_anchor_sources:
+        raise SystemExit(f"Unsupported LADDER_ENTRY_ANCHOR_SOURCE={entry_anchor_source}")
+    if recenter_mode not in allowed_recenter_modes:
+        raise SystemExit(f"Unsupported LADDER_RECENTER_MODE={recenter_mode}")
+    rung_consumption_mode = str(contract.get("rung_consumption_mode", RUNG_CONSUMPTION_MODE)).strip().lower()
+    rung_reuse_cooldown_buckets = max(1, int(float(contract.get("rung_reuse_cooldown_buckets", RUNG_REUSE_COOLDOWN_BUCKETS))))
+    allowed_rung_consumption_modes = {"none", "consume_until_rebalance", "consume_until_lot_closed", "consume_until_flat", "reusable_after_cooldown"}
+    if rung_consumption_mode not in allowed_rung_consumption_modes:
+        raise SystemExit(f"Unsupported LADDER_RUNG_CONSUMPTION_MODE={rung_consumption_mode}")
+    emergency_rebalance_mode = str(contract.get("emergency_rebalance_mode", EMERGENCY_REBALANCE_MODE)).strip().lower()
+    allowed_emergency_modes = {"off", "depleted_side_only", "depleted_side_if_anchor_accelerating"}
+    if emergency_rebalance_mode not in allowed_emergency_modes:
+        raise SystemExit(f"Unsupported LADDER_EMERGENCY_REBALANCE_MODE={emergency_rebalance_mode}")
+    emergency_remaining_rung_threshold = max(0, int(float(contract.get("emergency_remaining_rung_threshold", EMERGENCY_REMAINING_RUNG_THRESHOLD))))
+    emergency_min_interval_buckets = max(1, int(float(contract.get("emergency_min_interval_buckets", EMERGENCY_MIN_INTERVAL_BUCKETS))))
+    emergency_max_per_global_interval = max(0, int(float(contract.get("emergency_max_per_global_interval", EMERGENCY_MAX_PER_GLOBAL_INTERVAL))))
+    emergency_anchor_slope_bps = float(contract.get("emergency_anchor_slope_bps", EMERGENCY_ANCHOR_SLOPE_BPS))
+    emergency_anchor_accel_bps = float(contract.get("emergency_anchor_accel_bps", EMERGENCY_ANCHOR_ACCEL_BPS))
+    default_emergency_inventory_limit = max_open_units if not EMERGENCY_DISABLE_WHEN_INVENTORY_GE_ENV else int(float(EMERGENCY_DISABLE_WHEN_INVENTORY_GE_ENV))
+    emergency_disable_when_inventory_ge = int(float(contract.get("emergency_disable_when_inventory_ge", default_emergency_inventory_limit)))
+    emergency_disable_when_drawdown_bps = float(contract.get("emergency_disable_when_drawdown_bps", EMERGENCY_DISABLE_WHEN_DRAWDOWN_BPS))
     rebalance_interval_buckets = max(1, int(float(contract.get("rebalance_interval_buckets", REBALANCE_INTERVAL_BUCKETS))))
     rebalance_mode = str(contract.get("rebalance_mode", REBALANCE_MODE)).strip().lower()
     rebalance_anchor_drift_bps = float(contract.get("rebalance_anchor_drift_bps", REBALANCE_ANCHOR_DRIFT_BPS))
@@ -356,7 +412,7 @@ def simulate_config(
     spacing_vol_component = spacing_vol_mult * realized_vol_bps
     spacing = np.minimum(np.maximum(min_spacing_floor, spacing_vol_component), MAX_SPACING_BPS)
     stop_loss = np.maximum(min_stop_floor_bps, stop_loss_vol_mult * realized_vol_bps)
-    take_profit = take_profit_spacing_mult * spacing
+    take_profit = np.maximum(min_take_profit_bps, take_profit_spacing_mult * spacing)
     pred_final = gate["pred_final"].to_numpy(dtype=np.float64) if gate is not None else np.full(len(frame), np.nan)
     pred_max_up = gate["pred_max_up"].to_numpy(dtype=np.float64) if gate is not None else np.full(len(frame), np.nan)
     pred_max_down = gate["pred_max_down"].to_numpy(dtype=np.float64) if gate is not None else np.full(len(frame), np.nan)
@@ -405,6 +461,7 @@ def simulate_config(
     stop_loss_net_bps = 0.0
     timeout_net_bps = 0.0
     final_liquidation_net_bps = 0.0
+    closed_hold_buckets: list[int] = []
     cooldown_block_count = 0
     trend_filter_block_count = 0
     anchor_distance_block_count = 0
@@ -414,6 +471,34 @@ def simulate_config(
     fixed_interval_rebalance_count = 0
     stale_ladder_entry_count = 0
     rebalance_blocked_count = 0
+    recenter_count = 0
+    recenter_while_inventory_count = 0
+    recenter_blocked_by_inventory_count = 0
+    rung_consumed_count = 0
+    rung_reused_count = 0
+    duplicate_rung_trigger_block_count = 0
+    consumed_rung_block_count = 0
+    emergency_rebalance_count = 0
+    emergency_rebalance_buy_side_count = 0
+    emergency_rebalance_sell_side_count = 0
+    emergency_rebalance_blocked_cooldown_count = 0
+    emergency_rebalance_blocked_inventory_count = 0
+    emergency_rebalance_blocked_drawdown_count = 0
+    emergency_rebalance_blocked_slope_count = 0
+    emergency_rebalance_blocked_interval_count = 0
+    emergency_rebalance_blocked_max_per_global_count = 0
+    emergency_remaining_rungs_before: list[int] = []
+    rungs_refreshed_by_emergency_count = 0
+    last_emergency_rebalance_i = -1_000_000_000
+    emergency_count_in_global_interval = 0
+    rung_lifetime_buckets: list[int] = []
+    rung_consumed_by_rung = {rung: 0 for rung in range(1, contract["rung_count"] + 1)}
+    next_lot_id = 1
+    anchor_value_at_rebalance = math.nan
+    anchor_drift_since_last_rebalance_bps = math.nan
+    anchor_drift_values: list[float] = []
+    anchor_distance_entry_values: list[float] = []
+    anchor_distance_exit_values: list[float] = []
     rebalance_intervals: list[int] = []
     last_rebalance_i = -1
     ladder_anchor = math.nan
@@ -421,12 +506,148 @@ def simulate_config(
     ladder_take_profit = math.nan
     ladder_stop_loss = math.nan
     ladder_vol = math.nan
-    ladder_rung_prices: dict[int, float] = {}
+    ladder_rung_state: dict[int, dict[str, Any]] = {}
     cooldown_until_i = -1
     no_trade_reasons: dict[str, int] = {}
 
     def add_reason(reason: str) -> None:
         no_trade_reasons[reason] = no_trade_reasons.get(reason, 0) + 1
+
+    def reset_consumed_rung(rung_state: dict[str, Any], i: int) -> None:
+        nonlocal rung_reused_count
+        if rung_state.get("consumed"):
+            consumed_at = rung_state.get("consumed_at_bucket")
+            if consumed_at is not None:
+                rung_lifetime_buckets.append(i - int(consumed_at))
+            rung_reused_count += 1
+        rung_state["available"] = True
+        rung_state["consumed"] = False
+        rung_state["consumed_at_bucket"] = None
+        rung_state["linked_lot_id"] = None
+
+    def reset_consumed_rungs(i: int) -> None:
+        for rung_state in ladder_rung_state.values():
+            if rung_state.get("consumed"):
+                reset_consumed_rung(rung_state, i)
+
+    def create_rung_state(i: int) -> None:
+        if rung_consumption_mode == "consume_until_rebalance":
+            for rung_state in ladder_rung_state.values():
+                if rung_state.get("consumed") and rung_state.get("consumed_at_bucket") is not None:
+                    rung_lifetime_buckets.append(i - int(rung_state["consumed_at_bucket"]))
+        ladder_rung_state.clear()
+        for rung in range(1, contract["rung_count"] + 1):
+            ladder_rung_state[rung] = {
+                "rung_index": rung,
+                "rung_price": ladder_anchor * math.exp(-(rung * ladder_spacing) / 10_000.0),
+                "available": True,
+                "consumed": False,
+                "consumed_at_bucket": None,
+                "linked_lot_id": None,
+            }
+
+    def refresh_available_buy_rungs(i: int, a: float, s: float, tp: float, sl: float, rv: float) -> int:
+        nonlocal ladder_anchor, ladder_spacing, ladder_take_profit, ladder_stop_loss, ladder_vol
+        ladder_anchor = a
+        ladder_spacing = s
+        ladder_take_profit = tp
+        ladder_stop_loss = sl
+        ladder_vol = rv
+        refreshed = 0
+        for rung, rung_state in ladder_rung_state.items():
+            if rung_state.get("available") and not rung_state.get("consumed"):
+                rung_state["rung_price"] = ladder_anchor * math.exp(-(rung * ladder_spacing) / 10_000.0)
+                refreshed += 1
+        return refreshed
+
+    def release_lot_rung(unit: dict[str, float], i: int) -> None:
+        if rung_consumption_mode != "consume_until_lot_closed":
+            return
+        rung_state = ladder_rung_state.get(int(unit.get("rung", 0)))
+        if rung_state and rung_state.get("linked_lot_id") == unit.get("lot_id"):
+            reset_consumed_rung(rung_state, i)
+
+    def refresh_cooldown_rungs(i: int) -> None:
+        if rung_consumption_mode != "reusable_after_cooldown":
+            return
+        for rung_state in ladder_rung_state.values():
+            consumed_at = rung_state.get("consumed_at_bucket")
+            if rung_state.get("consumed") and consumed_at is not None and i - int(consumed_at) >= rung_reuse_cooldown_buckets:
+                reset_consumed_rung(rung_state, i)
+
+    def consume_rung(rung: int, i: int, lot_id: int) -> None:
+        nonlocal rung_consumed_count
+        if rung_consumption_mode == "none":
+            return
+        rung_state = ladder_rung_state.get(rung)
+        if not rung_state:
+            return
+        rung_state["available"] = False
+        rung_state["consumed"] = True
+        rung_state["consumed_at_bucket"] = i
+        rung_state["linked_lot_id"] = lot_id
+        rung_consumed_count += 1
+        rung_consumed_by_rung[rung] = rung_consumed_by_rung.get(rung, 0) + 1
+
+    def rung_available(rung: int) -> bool:
+        if rung_consumption_mode == "none":
+            return True
+        rung_state = ladder_rung_state.get(rung)
+        return bool(rung_state and rung_state.get("available"))
+
+    def maybe_emergency_rebalance(
+        i: int,
+        a: float,
+        s: float,
+        tp: float,
+        sl: float,
+        rv: float,
+        anchor_slope_bps: float,
+        anchor_accel_bps: float,
+        in_cooldown: bool,
+        current_drawdown_bps: float,
+    ) -> None:
+        nonlocal emergency_rebalance_count, emergency_rebalance_buy_side_count, emergency_rebalance_sell_side_count
+        nonlocal emergency_rebalance_blocked_cooldown_count, emergency_rebalance_blocked_inventory_count
+        nonlocal emergency_rebalance_blocked_drawdown_count, emergency_rebalance_blocked_slope_count
+        nonlocal emergency_rebalance_blocked_interval_count, emergency_rebalance_blocked_max_per_global_count
+        nonlocal last_emergency_rebalance_i, emergency_count_in_global_interval, rungs_refreshed_by_emergency_count
+        if emergency_rebalance_mode == "off" or not ladder_rung_state:
+            return
+        available_buy_rungs = sum(1 for rung_state in ladder_rung_state.values() if rung_state.get("available") and not rung_state.get("consumed"))
+        if available_buy_rungs > emergency_remaining_rung_threshold:
+            return
+        if in_cooldown:
+            emergency_rebalance_blocked_cooldown_count += 1
+            return
+        if len(open_entries) >= emergency_disable_when_inventory_ge:
+            emergency_rebalance_blocked_inventory_count += 1
+            return
+        if math.isfinite(current_drawdown_bps) and current_drawdown_bps <= -abs(emergency_disable_when_drawdown_bps):
+            emergency_rebalance_blocked_drawdown_count += 1
+            return
+        if i - last_emergency_rebalance_i < emergency_min_interval_buckets:
+            emergency_rebalance_blocked_interval_count += 1
+            return
+        if emergency_count_in_global_interval >= emergency_max_per_global_interval:
+            emergency_rebalance_blocked_max_per_global_count += 1
+            return
+        if emergency_rebalance_mode == "depleted_side_if_anchor_accelerating":
+            slope_ok = math.isfinite(anchor_slope_bps) and anchor_slope_bps >= emergency_anchor_slope_bps
+            accel_ok = math.isfinite(anchor_accel_bps) and anchor_accel_bps >= emergency_anchor_accel_bps
+            if not (slope_ok and accel_ok):
+                emergency_rebalance_blocked_slope_count += 1
+                return
+        refreshed = refresh_available_buy_rungs(i, a, s, tp, sl, rv)
+        if refreshed <= 0:
+            return
+        emergency_remaining_rungs_before.append(available_buy_rungs)
+        emergency_rebalance_count += 1
+        emergency_rebalance_buy_side_count += 1
+        emergency_rebalance_sell_side_count += 0
+        rungs_refreshed_by_emergency_count += refreshed
+        last_emergency_rebalance_i = i
+        emergency_count_in_global_interval += 1
 
     def close_lot(unit: dict[str, float], exit_i: int, exit_price: float, exit_reason: str, tp_bps: float, stop_bps: float) -> float:
         nonlocal realized_gross, realized_net, take_profit_exit_count, stop_loss_exit_count
@@ -448,10 +669,16 @@ def simulate_config(
         elif exit_reason == "final_liquidation":
             final_liquidation_count += 1
             final_liquidation_net_bps += net
+        closed_hold_buckets.append(exit_i - int(unit["entry_bucket"]))
+        exit_anchor = float(anchor[exit_i]) if len(anchor) > exit_i else math.nan
+        if math.isfinite(exit_anchor) and exit_anchor > 0:
+            anchor_distance_exit_values.append(10_000.0 * math.log(exit_price / exit_anchor))
+        release_lot_rung(unit, exit_i)
         trades.append(
             {
                 "entry_timestamp": unit["entry_timestamp"],
                 "exit_timestamp": timestamp[exit_i],
+                "lot_id": int(unit.get("lot_id", 0)),
                 "entry_bucket": int(unit["entry_bucket"]),
                 "exit_bucket": exit_i,
                 "hold_buckets": exit_i - int(unit["entry_bucket"]),
@@ -469,13 +696,45 @@ def simulate_config(
         )
         return net
 
+    def timeout_should_close(
+        unit: dict[str, float],
+        p: float,
+        age: int,
+        anchor_distance_bps: float,
+        anchor_slope_bps: float,
+        trend_filter_block: bool,
+        anchor_distance_block: bool,
+    ) -> bool:
+        if age < max_hold_buckets or timeout_exit_mode == "disable_timeout":
+            return False
+        if timeout_exit_mode == "market":
+            return True
+        gross = 10_000.0 * math.log(p / unit["entry_price"])
+        net = gross - 2.0 * DEFAULT_COST_BPS
+        if timeout_exit_mode == "breakeven_only":
+            return net >= 0.0
+        if timeout_exit_mode == "trend_invalid_only":
+            return trend_filter_block or anchor_distance_block or anchor_distance_bps < 0.0 or anchor_slope_bps < 0.0
+        return False
+
     def refresh_ladder(i: int, a: float, s: float, tp: float, sl: float, rv: float, reason: str) -> None:
         nonlocal rebalance_count, anchor_drift_rebalance_count, volatility_rebalance_count
         nonlocal fixed_interval_rebalance_count, last_rebalance_i, ladder_anchor, ladder_spacing
-        nonlocal ladder_take_profit, ladder_stop_loss, ladder_vol, ladder_rung_prices
+        nonlocal ladder_take_profit, ladder_stop_loss, ladder_vol
+        nonlocal recenter_count, recenter_while_inventory_count, anchor_value_at_rebalance
+        nonlocal anchor_drift_since_last_rebalance_bps, emergency_count_in_global_interval
         if last_rebalance_i >= 0:
             rebalance_intervals.append(i - last_rebalance_i)
+            if math.isfinite(ladder_anchor) and ladder_anchor > 0:
+                anchor_drift_since_last_rebalance_bps = 10_000.0 * math.log(a / ladder_anchor)
+                anchor_drift_values.append(anchor_drift_since_last_rebalance_bps)
+        else:
+            anchor_drift_since_last_rebalance_bps = 0.0
+            anchor_drift_values.append(0.0)
         rebalance_count += 1
+        recenter_count += 1
+        if open_entries:
+            recenter_while_inventory_count += 1
         if reason == "fixed_interval":
             fixed_interval_rebalance_count += 1
         elif reason == "anchor_drift":
@@ -484,14 +743,13 @@ def simulate_config(
             volatility_rebalance_count += 1
         last_rebalance_i = i
         ladder_anchor = a
+        anchor_value_at_rebalance = a
         ladder_spacing = s
         ladder_take_profit = tp
         ladder_stop_loss = sl
         ladder_vol = rv
-        ladder_rung_prices = {
-            rung: ladder_anchor * math.exp(-(rung * ladder_spacing) / 10_000.0)
-            for rung in range(1, contract["rung_count"] + 1)
-        }
+        emergency_count_in_global_interval = 0
+        create_rung_state(i)
 
     def rebalance_reason(i: int, a: float, rv: float) -> str:
         if last_rebalance_i < 0:
@@ -520,6 +778,22 @@ def simulate_config(
                 return "volatility"
         return ""
 
+    def recenter_allowed(reason: str) -> bool:
+        nonlocal recenter_blocked_by_inventory_count
+        if not reason:
+            return False
+        if recenter_mode == "fixed_interval" and reason != "fixed_interval":
+            return False
+        if recenter_mode == "anchor_drift_trigger" and reason != "anchor_drift":
+            return False
+        if recenter_mode == "never_while_inventory_open" and open_entries:
+            recenter_blocked_by_inventory_count += 1
+            return False
+        if recenter_mode == "interval_only_when_flat" and reason == "fixed_interval" and open_entries:
+            recenter_blocked_by_inventory_count += 1
+            return False
+        return True
+
     for i in range(1, len(price)):
         p = float(price[i])
         a = float(anchor[i])
@@ -533,7 +807,7 @@ def simulate_config(
             last_price = p
             continue
         reason = rebalance_reason(i, a, rv)
-        if reason:
+        if reason and recenter_allowed(reason):
             refresh_ladder(i, a, s, tp, sl, rv, reason)
         rows_seen += 1
         has_model_prediction = gate is not None and all(math.isfinite(x) for x in [pred_final[i], pred_max_up[i], pred_max_down[i]])
@@ -541,7 +815,14 @@ def simulate_config(
             rows_with_model_prediction += 1
         if last_price <= a < p or last_price >= a > p:
             anchor_cross_count += 1
+        refresh_cooldown_rungs(i)
 
+        anchor_distance_bps = 10_000.0 * math.log(p / a)
+        anchor_slope_bps = 10_000.0 * math.log(a / anchor[i - 1]) if i > 0 and math.isfinite(anchor[i - 1]) and anchor[i - 1] > 0 else math.nan
+        prev_anchor_slope_bps = 10_000.0 * math.log(anchor[i - 1] / anchor[i - 2]) if i > 1 and math.isfinite(anchor[i - 1]) and math.isfinite(anchor[i - 2]) and anchor[i - 1] > 0 and anchor[i - 2] > 0 else math.nan
+        anchor_accel_bps = anchor_slope_bps - prev_anchor_slope_bps if math.isfinite(anchor_slope_bps) and math.isfinite(prev_anchor_slope_bps) else math.nan
+        anchor_distance_block = anchor_distance_bps < -abs(DISABLE_BUYS_WHEN_PRICE_BELOW_ANCHOR_BPS)
+        trend_filter_block = math.isfinite(anchor_slope_bps) and anchor_slope_bps < DISABLE_BUYS_WHEN_EMA_SLOPE_BELOW_BPS
         remaining = []
         for unit in open_entries:
             unit_tp = float(unit.get("take_profit_bps", tp))
@@ -553,7 +834,7 @@ def simulate_config(
                 close_lot(unit, i, p, "stop_loss", unit_tp, unit_sl)
                 rung_key = int(unit["rung"])
                 sell_count_by_rung[rung_key] = sell_count_by_rung.get(rung_key, 0) + 1
-            elif age >= max_hold_buckets:
+            elif timeout_should_close(unit, p, age, anchor_distance_bps, anchor_slope_bps, trend_filter_block, anchor_distance_block):
                 close_lot(unit, i, p, "timeout", unit_tp, unit_sl)
                 rung_key = int(unit["rung"])
                 sell_count_by_rung[rung_key] = sell_count_by_rung.get(rung_key, 0) + 1
@@ -564,6 +845,8 @@ def simulate_config(
             else:
                 remaining.append(unit)
         open_entries = remaining
+        if rung_consumption_mode == "consume_until_flat" and not open_entries:
+            reset_consumed_rungs(i)
 
         open_gross = sum(10_000.0 * math.log(p / unit["entry_price"]) for unit in open_entries)
         open_net = open_gross - DEFAULT_COST_BPS * len(open_entries)
@@ -587,6 +870,9 @@ def simulate_config(
             exposure_steps += 1
         if math.isfinite(MAX_DRAWDOWN_BPS) and equity - max(equity_curve) <= -abs(MAX_DRAWDOWN_BPS):
             halted_by_drawdown = True
+        current_drawdown_bps = equity - max(equity_curve) if equity_curve else 0.0
+        in_cooldown = i <= cooldown_until_i
+        maybe_emergency_rebalance(i, a, s, tp, sl, rv, anchor_slope_bps, anchor_accel_bps, in_cooldown, current_drawdown_bps)
 
         break_level = ladder_anchor * math.exp(-(contract["rung_count"] * ladder_spacing + RANGE_BREAK_BUFFER_BPS) / 10_000.0)
         upper_break_level = ladder_anchor * math.exp((contract["rung_count"] * ladder_spacing + RANGE_BREAK_BUFFER_BPS) / 10_000.0)
@@ -595,18 +881,21 @@ def simulate_config(
         if p > upper_break_level:
             range_break_up_count += 1
         triggered_rungs = []
+        blocked_triggered_rungs = []
         for rung in range(1, contract["rung_count"] + 1):
-            rung_price = ladder_rung_prices.get(rung, math.nan)
+            rung_state = ladder_rung_state.get(rung, {})
+            rung_price = float(rung_state.get("rung_price", math.nan))
             if last_price > rung_price >= p:
-                triggered_rungs.append(rung)
                 rung_trigger_by_rung[rung] = rung_trigger_by_rung.get(rung, 0) + 1
+                if rung_available(rung):
+                    triggered_rungs.append(rung)
+                else:
+                    blocked_triggered_rungs.append(rung)
         if triggered_rungs:
             rows_rung_triggered += 1
-        anchor_distance_bps = 10_000.0 * math.log(p / a)
-        anchor_slope_bps = 10_000.0 * math.log(a / anchor[i - 1]) if i > 0 and math.isfinite(anchor[i - 1]) and anchor[i - 1] > 0 else math.nan
-        in_cooldown = i <= cooldown_until_i
-        anchor_distance_block = anchor_distance_bps < -abs(DISABLE_BUYS_WHEN_PRICE_BELOW_ANCHOR_BPS)
-        trend_filter_block = math.isfinite(anchor_slope_bps) and anchor_slope_bps < DISABLE_BUYS_WHEN_EMA_SLOPE_BELOW_BPS
+        if blocked_triggered_rungs:
+            duplicate_rung_trigger_block_count += len(blocked_triggered_rungs)
+            consumed_rung_block_count += len(blocked_triggered_rungs)
         can_add = p >= break_level and not halted_by_drawdown and not in_cooldown and not anchor_distance_block and not trend_filter_block
         gate_ok = model_gate_allows(MODEL_GATE_MODE, pred_final[i], pred_max_up[i], pred_max_down[i], ladder_take_profit)
         if gate_ok:
@@ -645,8 +934,11 @@ def simulate_config(
                     no_new_buy_due_to_max_inventory_count += 1
                     add_reason("max_inventory")
                     break
+                lot_id = next_lot_id
+                next_lot_id += 1
                 open_entries.append(
                     {
+                        "lot_id": float(lot_id),
                         "entry_price": p,
                         "entry_timestamp": timestamp[i],
                         "entry_bucket": float(i),
@@ -656,6 +948,9 @@ def simulate_config(
                         "ladder_rebalance_bucket": float(last_rebalance_i),
                     }
                 )
+                consume_rung(rung, i, lot_id)
+                if math.isfinite(a) and a > 0:
+                    anchor_distance_entry_values.append(10_000.0 * math.log(p / a))
                 if i > last_rebalance_i:
                     stale_ladder_entry_count += 1
                 buy_count_by_rung[rung] = buy_count_by_rung.get(rung, 0) + 1
@@ -684,6 +979,10 @@ def simulate_config(
         open_entries = []
     final_open_gross = sum(10_000.0 * math.log(final_price / unit["entry_price"]) for unit in open_entries) if math.isfinite(final_price) else 0.0
     final_open_net = final_open_gross - DEFAULT_COST_BPS * len(open_entries)
+    for rung_state in ladder_rung_state.values():
+        consumed_at = rung_state.get("consumed_at_bucket")
+        if rung_state.get("consumed") and consumed_at is not None:
+            rung_lifetime_buckets.append(final_i - int(consumed_at))
     force_flat_total_net = realized_net
     total_net = realized_net + final_open_net
     trade_nets = [trade["net_bps"] for trade in trades]
@@ -694,11 +993,27 @@ def simulate_config(
 
     result = {
         **contract,
+        "anchor_mode": anchor_mode,
+        "anchor_window_seconds": int(contract["anchor_window"]) * BUCKET_SECONDS,
+        "entry_anchor_source": entry_anchor_source,
+        "recenter_mode": recenter_mode,
+        "rung_consumption_mode": rung_consumption_mode,
+        "rung_reuse_cooldown_buckets": rung_reuse_cooldown_buckets,
+        "emergency_rebalance_mode": emergency_rebalance_mode,
+        "emergency_remaining_rung_threshold": emergency_remaining_rung_threshold,
+        "emergency_min_interval_buckets": emergency_min_interval_buckets,
+        "emergency_max_per_global_interval": emergency_max_per_global_interval,
+        "emergency_anchor_slope_bps": emergency_anchor_slope_bps,
+        "emergency_anchor_accel_bps": emergency_anchor_accel_bps,
+        "emergency_disable_when_inventory_ge": emergency_disable_when_inventory_ge,
+        "emergency_disable_when_drawdown_bps": emergency_disable_when_drawdown_bps,
         "spacing_vol_mult": spacing_vol_mult,
         "stop_loss_vol_mult": stop_loss_vol_mult,
         "take_profit_spacing_mult": take_profit_spacing_mult,
+        "min_take_profit_bps": min_take_profit_bps,
         "min_spacing_floor_mode": min_spacing_floor_mode,
         "min_stop_floor_bps": min_stop_floor_bps,
+        "timeout_exit_mode": timeout_exit_mode,
         "rebalance_interval_buckets": rebalance_interval_buckets,
         "rebalance_mode": rebalance_mode,
         "rebalance_anchor_drift_bps": rebalance_anchor_drift_bps,
@@ -741,6 +1056,7 @@ def simulate_config(
         "stop_loss_net_bps": stop_loss_net_bps,
         "timeout_net_bps": timeout_net_bps,
         "final_liquidation_net_bps": final_liquidation_net_bps,
+        "average_hold_buckets": float(np.mean(closed_hold_buckets)) if closed_hold_buckets else math.nan,
         "cooldown_block_count": cooldown_block_count,
         "trend_filter_block_count": trend_filter_block_count,
         "anchor_distance_block_count": anchor_distance_block_count,
@@ -752,6 +1068,31 @@ def simulate_config(
         "trades_per_rebalance": len(trades) / max(1, rebalance_count),
         "stale_ladder_entry_count": stale_ladder_entry_count,
         "rebalance_blocked_count": rebalance_blocked_count,
+        "anchor_value_at_rebalance": anchor_value_at_rebalance,
+        "anchor_drift_since_last_rebalance_bps": anchor_drift_since_last_rebalance_bps,
+        "avg_anchor_drift_since_rebalance_bps": float(np.mean(np.abs(anchor_drift_values))) if anchor_drift_values else math.nan,
+        "recenter_count": recenter_count,
+        "recenter_while_inventory_count": recenter_while_inventory_count,
+        "recenter_blocked_by_inventory_count": recenter_blocked_by_inventory_count,
+        "avg_anchor_distance_entry_bps": float(np.mean(anchor_distance_entry_values)) if anchor_distance_entry_values else math.nan,
+        "avg_anchor_distance_exit_bps": float(np.mean(anchor_distance_exit_values)) if anchor_distance_exit_values else math.nan,
+        "rung_consumed_count": rung_consumed_count,
+        "rung_reused_count": rung_reused_count,
+        "duplicate_rung_trigger_block_count": duplicate_rung_trigger_block_count,
+        "consumed_rung_block_count": consumed_rung_block_count,
+        "avg_rung_lifetime_buckets": float(np.mean(rung_lifetime_buckets)) if rung_lifetime_buckets else math.nan,
+        "per_rung_consumed_count": count_map_text(rung_consumed_by_rung),
+        "emergency_rebalance_count": emergency_rebalance_count,
+        "emergency_rebalance_buy_side_count": emergency_rebalance_buy_side_count,
+        "emergency_rebalance_sell_side_count": emergency_rebalance_sell_side_count,
+        "emergency_rebalance_blocked_cooldown_count": emergency_rebalance_blocked_cooldown_count,
+        "emergency_rebalance_blocked_inventory_count": emergency_rebalance_blocked_inventory_count,
+        "emergency_rebalance_blocked_drawdown_count": emergency_rebalance_blocked_drawdown_count,
+        "emergency_rebalance_blocked_slope_count": emergency_rebalance_blocked_slope_count,
+        "emergency_rebalance_blocked_interval_count": emergency_rebalance_blocked_interval_count,
+        "emergency_rebalance_blocked_max_per_global_count": emergency_rebalance_blocked_max_per_global_count,
+        "avg_remaining_rungs_before_emergency": float(np.mean(emergency_remaining_rungs_before)) if emergency_remaining_rungs_before else math.nan,
+        "rungs_refreshed_by_emergency_count": rungs_refreshed_by_emergency_count,
         "force_flat_total_net_bps": force_flat_total_net,
         "total_net_bps": total_net,
         "realized_net_bps": realized_net,
@@ -944,14 +1285,21 @@ def write_text(path: Path, rows: list[dict[str, Any]], best: dict[str, Any]) -> 
             f"realized={safe_float(row.get('realized_net_bps')):.3f} unrealized={safe_float(row.get('unrealized_net_bps')):.3f} "
             f"dd={safe_float(row.get('max_drawdown_bps')):.3f} trades={row.get('number_of_trades')} "
             f"tp={row.get('take_profit_exit_count')} sl={row.get('stop_loss_exit_count')} timeout={row.get('timeout_exit_count')} final={row.get('final_liquidation_count')} "
+            f"timeout_mode={row.get('timeout_exit_mode')} timeout_net={safe_float(row.get('timeout_net_bps')):.3f} avg_hold={safe_float(row.get('average_hold_buckets')):.3f} "
             f"win={row.get('win_rate')} inv={row.get('max_inventory')} "
             f"avg_spacing={safe_float(row.get('avg_spacing_bps')):.3f} max_rung={row.get('max_rung_reached')} "
             f"vol_used={safe_float(row.get('volatility_used_fraction')):.3f} floor_used={safe_float(row.get('floor_used_fraction')):.3f} "
             f"rebalances={row.get('rebalance_count')} trades_per_rebalance={safe_float(row.get('trades_per_rebalance')):.3f} "
+            f"recenter={row.get('recenter_count')} recenter_blocked={row.get('recenter_blocked_by_inventory_count')} "
+            f"rung_consumed={row.get('rung_consumed_count')} rung_blocks={row.get('duplicate_rung_trigger_block_count')} "
+            f"emergency={row.get('emergency_rebalance_count')} emergency_rungs={row.get('rungs_refreshed_by_emergency_count')} "
             f"gate_pass={safe_float(row.get('gate_pass_fraction')):.3f} reason={row.get('most_common_no_trade_reason')} "
-            f"anchor={row.get('anchor_window')} vol={row.get('vol_window')} spacing_mult={row.get('spacing_vol_mult', row.get('vol_mult'))} "
+            f"anchor={row.get('anchor_mode')}:{row.get('anchor_window')}s={row.get('anchor_window_seconds')} recenter_mode={row.get('recenter_mode')} "
+            f"rung_mode={row.get('rung_consumption_mode')} "
+            f"emergency_mode={row.get('emergency_rebalance_mode')} "
+            f"vol={row.get('vol_window')} spacing_mult={row.get('spacing_vol_mult', row.get('vol_mult'))} "
             f"floor_mode={row.get('min_spacing_floor_mode')} rungs={row.get('rung_count')} "
-            f"tp_spacing_mult={row.get('take_profit_spacing_mult', row.get('take_profit_mult'))} "
+            f"tp_spacing_mult={row.get('take_profit_spacing_mult', row.get('take_profit_mult'))} min_tp={row.get('min_take_profit_bps')} "
             f"stop_vol_mult={row.get('stop_loss_vol_mult')} stop_floor={row.get('min_stop_floor_bps', row.get('stop_loss_bps'))} hold={row.get('max_hold_buckets')}"
             f" rebalance={row.get('rebalance_mode')}@{row.get('rebalance_interval_buckets')}"
         )
@@ -973,6 +1321,33 @@ def write_text(path: Path, rows: list[dict[str, Any]], best: dict[str, Any]) -> 
             f"  avg_spacing_to_vol_ratio={best.get('avg_spacing_to_vol_ratio')}",
             f"  avg_stop_to_vol_ratio={best.get('avg_stop_to_vol_ratio')}",
             f"  rebalance_count={best.get('rebalance_count')}",
+            f"  anchor_window_seconds={best.get('anchor_window_seconds')}",
+            f"  anchor_value_at_rebalance={best.get('anchor_value_at_rebalance')}",
+            f"  anchor_drift_since_last_rebalance_bps={best.get('anchor_drift_since_last_rebalance_bps')}",
+            f"  recenter_count={best.get('recenter_count')}",
+            f"  recenter_while_inventory_count={best.get('recenter_while_inventory_count')}",
+            f"  recenter_blocked_by_inventory_count={best.get('recenter_blocked_by_inventory_count')}",
+            f"  avg_anchor_distance_entry_bps={best.get('avg_anchor_distance_entry_bps')}",
+            f"  avg_anchor_distance_exit_bps={best.get('avg_anchor_distance_exit_bps')}",
+            f"  rung_consumption_mode={best.get('rung_consumption_mode')}",
+            f"  rung_consumed_count={best.get('rung_consumed_count')}",
+            f"  rung_reused_count={best.get('rung_reused_count')}",
+            f"  duplicate_rung_trigger_block_count={best.get('duplicate_rung_trigger_block_count')}",
+            f"  consumed_rung_block_count={best.get('consumed_rung_block_count')}",
+            f"  avg_rung_lifetime_buckets={best.get('avg_rung_lifetime_buckets')}",
+            f"  per_rung_consumed_count={best.get('per_rung_consumed_count')}",
+            f"  emergency_rebalance_mode={best.get('emergency_rebalance_mode')}",
+            f"  emergency_rebalance_count={best.get('emergency_rebalance_count')}",
+            f"  emergency_rebalance_buy_side_count={best.get('emergency_rebalance_buy_side_count')}",
+            f"  emergency_rebalance_sell_side_count={best.get('emergency_rebalance_sell_side_count')}",
+            f"  emergency_rebalance_blocked_cooldown_count={best.get('emergency_rebalance_blocked_cooldown_count')}",
+            f"  emergency_rebalance_blocked_inventory_count={best.get('emergency_rebalance_blocked_inventory_count')}",
+            f"  emergency_rebalance_blocked_drawdown_count={best.get('emergency_rebalance_blocked_drawdown_count')}",
+            f"  emergency_rebalance_blocked_slope_count={best.get('emergency_rebalance_blocked_slope_count')}",
+            f"  emergency_rebalance_blocked_interval_count={best.get('emergency_rebalance_blocked_interval_count')}",
+            f"  emergency_rebalance_blocked_max_per_global_count={best.get('emergency_rebalance_blocked_max_per_global_count')}",
+            f"  avg_remaining_rungs_before_emergency={best.get('avg_remaining_rungs_before_emergency')}",
+            f"  rungs_refreshed_by_emergency_count={best.get('rungs_refreshed_by_emergency_count')}",
             f"  avg_rebalance_interval_buckets={best.get('avg_rebalance_interval_buckets')}",
             f"  anchor_drift_rebalance_count={best.get('anchor_drift_rebalance_count')}",
             f"  volatility_rebalance_count={best.get('volatility_rebalance_count')}",
@@ -988,6 +1363,9 @@ def write_text(path: Path, rows: list[dict[str, Any]], best: dict[str, Any]) -> 
             f"  take_profit_exit_count={best.get('take_profit_exit_count')}",
             f"  stop_loss_exit_count={best.get('stop_loss_exit_count')}",
             f"  timeout_exit_count={best.get('timeout_exit_count')}",
+            f"  timeout_exit_mode={best.get('timeout_exit_mode')}",
+            f"  timeout_net_bps={best.get('timeout_net_bps')}",
+            f"  average_hold_buckets={best.get('average_hold_buckets')}",
             f"  final_liquidation_count={best.get('final_liquidation_count')}",
             f"  cooldown_block_count={best.get('cooldown_block_count')}",
             f"  trend_filter_block_count={best.get('trend_filter_block_count')}",
@@ -1015,6 +1393,18 @@ def main() -> int:
         {
             "anchor_mode": ANCHOR_MODE,
             "anchor_window": anchor_window,
+            "entry_anchor_source": ENTRY_ANCHOR_SOURCE,
+            "recenter_mode": RECENTER_MODE,
+            "rung_consumption_mode": RUNG_CONSUMPTION_MODE,
+            "rung_reuse_cooldown_buckets": RUNG_REUSE_COOLDOWN_BUCKETS,
+            "emergency_rebalance_mode": EMERGENCY_REBALANCE_MODE,
+            "emergency_remaining_rung_threshold": EMERGENCY_REMAINING_RUNG_THRESHOLD,
+            "emergency_min_interval_buckets": EMERGENCY_MIN_INTERVAL_BUCKETS,
+            "emergency_max_per_global_interval": EMERGENCY_MAX_PER_GLOBAL_INTERVAL,
+            "emergency_anchor_slope_bps": EMERGENCY_ANCHOR_SLOPE_BPS,
+            "emergency_anchor_accel_bps": EMERGENCY_ANCHOR_ACCEL_BPS,
+            "emergency_disable_when_inventory_ge": int(float(EMERGENCY_DISABLE_WHEN_INVENTORY_GE_ENV)) if EMERGENCY_DISABLE_WHEN_INVENTORY_GE_ENV else max_open_units,
+            "emergency_disable_when_drawdown_bps": EMERGENCY_DISABLE_WHEN_DRAWDOWN_BPS,
             "vol_window": vol_window,
             "spacing_mode": SPACING_MODE,
             "vol_mult": spacing_vol_mult,
@@ -1022,6 +1412,7 @@ def main() -> int:
             "rung_count": rung_count,
             "take_profit_mult": take_profit_spacing_mult,
             "take_profit_spacing_mult": take_profit_spacing_mult,
+            "min_take_profit_bps": MIN_TAKE_PROFIT_BPS,
             "min_spacing_bps": min_spacing_bps,
             "min_spacing_floor_mode": min_spacing_floor_mode,
             "cost_bps": DEFAULT_COST_BPS,
@@ -1030,6 +1421,7 @@ def main() -> int:
             "min_stop_floor_bps": min_stop_floor_bps,
             "stop_loss_vol_mult": stop_loss_vol_mult,
             "max_hold_buckets": max_hold_buckets,
+            "timeout_exit_mode": TIMEOUT_EXIT_MODE,
             "cooldown_after_stop_buckets": COOLDOWN_AFTER_STOP_BUCKETS,
             "disable_buys_when_price_below_anchor_bps": DISABLE_BUYS_WHEN_PRICE_BELOW_ANCHOR_BPS,
             "disable_buys_when_ema_slope_below_bps": DISABLE_BUYS_WHEN_EMA_SLOPE_BELOW_BPS,

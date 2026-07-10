@@ -46,20 +46,31 @@ MAX_ROWS_PER_SLICE_ENV = os.getenv("LADDER_SWEEP_MAX_ROWS_PER_SLICE", "").strip(
 MAX_ROWS_PER_SLICE = int(float(MAX_ROWS_PER_SLICE_ENV)) if MAX_ROWS_PER_SLICE_ENV else 0
 SIM_PATH = PROJECT_ROOT / "scripts" / "tiny" / "simulate_path_aware_ladder_baseline.py"
 
-ANCHOR_WINDOWS = [60, 150, 300]
+ANCHOR_MODES = ["ema", "rolling_ma"]
+ANCHOR_WINDOWS = [300, 900, 1800, 3600]
+ENTRY_ANCHOR_SOURCES = ["frozen_rebalance_anchor"]
+RECENTER_MODES = ["fixed_interval", "never_while_inventory_open", "interval_only_when_flat"]
+RUNG_CONSUMPTION_MODES = ["consume_until_rebalance", "consume_until_flat", "reusable_after_cooldown"]
+RUNG_REUSE_COOLDOWN_BUCKETS = [180]
+EMERGENCY_REBALANCE_MODES = ["off", "depleted_side_only", "depleted_side_if_anchor_accelerating"]
+EMERGENCY_REMAINING_RUNG_THRESHOLDS = [1, 2]
+EMERGENCY_MIN_INTERVAL_BUCKETS = [60, 180]
+EMERGENCY_MAX_PER_GLOBAL_INTERVAL = [1]
 VOL_WINDOWS = [60, 150, 300]
-MIN_SPACING_BPS = [20.0, 40.0, 60.0, 80.0]
+MIN_SPACING_BPS = [10.0, 20.0, 40.0]
 MIN_SPACING_FLOOR_MODES = ["fixed_bps", "spread_multiple", "tick_multiple", "max_fixed_or_spread"]
 SPACING_VOL_MULTS = [1.0, 2.0, 4.0]
 MAX_OPEN_UNITS = [1, 2]
-STOP_LOSS_BPS = [60.0, 80.0, 120.0, 160.0, 240.0]
-STOP_LOSS_VOL_MULTS = [4.0, 8.0, 12.0]
-MAX_HOLD_BUCKETS = [60, 180, 360, 720]
-TAKE_PROFIT_SPACING_MULTS = [1.0, 1.25, 1.5]
+STOP_LOSS_BPS = [60.0, 80.0, 120.0]
+STOP_LOSS_VOL_MULTS = [4.0, 6.0, 8.0]
+MAX_HOLD_BUCKETS = [180, 360, 720, 1440]
+TAKE_PROFIT_SPACING_MULTS = [0.25, 0.5, 0.75, 1.0]
+MIN_TAKE_PROFIT_BPS = [5.0, 10.0, 15.0, 20.0]
+TIMEOUT_EXIT_MODES = ["market", "breakeven_only", "trend_invalid_only", "disable_timeout"]
 COOLDOWNS = [30, 60, 180]
 ANCHOR_DISTANCE_LIMITS = [60.0, 120.0, 240.0]
 EMA_SLOPE_LIMITS = [-2.0, 0.0, 2.0]
-REBALANCE_INTERVAL_BUCKETS = [30, 90, 180, 360]
+REBALANCE_INTERVAL_BUCKETS = [90, 180, 360]
 REBALANCE_MODES = ["fixed_interval"]
 
 
@@ -78,6 +89,11 @@ def safe_float(value: Any, default: float = math.nan) -> float:
 def safe_int(value: Any, default: int = 0) -> int:
     value = safe_float(value)
     return int(value) if math.isfinite(value) else default
+
+
+def nanmean_or_nan(values: np.ndarray) -> float:
+    finite = values[np.isfinite(values)]
+    return float(np.mean(finite)) if len(finite) else math.nan
 
 
 def load_simulator_module():
@@ -104,56 +120,122 @@ def timestamp_iso(value: Any) -> str:
 
 
 def iter_configs() -> list[dict[str, Any]]:
+    axes = [
+        ANCHOR_MODES,
+        ANCHOR_WINDOWS,
+        ENTRY_ANCHOR_SOURCES,
+        RECENTER_MODES,
+        RUNG_CONSUMPTION_MODES,
+        RUNG_REUSE_COOLDOWN_BUCKETS,
+        EMERGENCY_REBALANCE_MODES,
+        EMERGENCY_REMAINING_RUNG_THRESHOLDS,
+        EMERGENCY_MIN_INTERVAL_BUCKETS,
+        EMERGENCY_MAX_PER_GLOBAL_INTERVAL,
+        VOL_WINDOWS,
+        SPACING_VOL_MULTS,
+        MIN_SPACING_BPS,
+        MIN_SPACING_FLOOR_MODES,
+        MAX_OPEN_UNITS,
+        STOP_LOSS_BPS,
+        STOP_LOSS_VOL_MULTS,
+        MAX_HOLD_BUCKETS,
+        TAKE_PROFIT_SPACING_MULTS,
+        MIN_TAKE_PROFIT_BPS,
+        TIMEOUT_EXIT_MODES,
+        COOLDOWNS,
+        ANCHOR_DISTANCE_LIMITS,
+        EMA_SLOPE_LIMITS,
+        REBALANCE_INTERVAL_BUCKETS,
+        REBALANCE_MODES,
+    ]
+    total = math.prod(len(axis) for axis in axes)
+    if SMOKE_MODE:
+        sample_count = min(MAX_CONFIGS, total)
+        indexes = np.linspace(0, total - 1, sample_count, dtype=np.int64).tolist()
+    else:
+        indexes = list(range(min(MAX_CONFIGS, total)))
+
     configs = []
-    for anchor_window in ANCHOR_WINDOWS:
-        for vol_window in VOL_WINDOWS:
-            for spacing_vol_mult in SPACING_VOL_MULTS:
-                for min_spacing in MIN_SPACING_BPS:
-                    for min_spacing_floor_mode in MIN_SPACING_FLOOR_MODES:
-                        for max_units in MAX_OPEN_UNITS:
-                            for stop_loss in STOP_LOSS_BPS:
-                                for stop_loss_vol_mult in STOP_LOSS_VOL_MULTS:
-                                    for max_hold in MAX_HOLD_BUCKETS:
-                                        for take_profit_spacing_mult in TAKE_PROFIT_SPACING_MULTS:
-                                            for cooldown in COOLDOWNS:
-                                                for anchor_distance in ANCHOR_DISTANCE_LIMITS:
-                                                    for ema_slope in EMA_SLOPE_LIMITS:
-                                                        for rebalance_interval in REBALANCE_INTERVAL_BUCKETS:
-                                                            for rebalance_mode in REBALANCE_MODES:
-                                                                configs.append(
-                                                                    {
-                                                                        "anchor_mode": "ema",
-                                                                        "anchor_window": anchor_window,
-                                                                        "vol_window": vol_window,
-                                                                        "spacing_mode": "volatility_scaled",
-                                                                        "vol_mult": spacing_vol_mult,
-                                                                        "spacing_vol_mult": spacing_vol_mult,
-                                                                        "rung_count": 3,
-                                                                        "take_profit_mult": take_profit_spacing_mult,
-                                                                        "take_profit_spacing_mult": take_profit_spacing_mult,
-                                                                        "min_spacing_bps": min_spacing,
-                                                                        "min_spacing_floor_mode": min_spacing_floor_mode,
-                                                                        "cost_bps": 0.1,
-                                                                        "max_open_units": max_units,
-                                                                        "stop_loss_bps": stop_loss,
-                                                                        "min_stop_floor_bps": stop_loss,
-                                                                        "stop_loss_vol_mult": stop_loss_vol_mult,
-                                                                        "max_hold_buckets": max_hold,
-                                                                        "cooldown_after_stop_buckets": cooldown,
-                                                                        "disable_buys_when_price_below_anchor_bps": anchor_distance,
-                                                                        "disable_buys_when_ema_slope_below_bps": ema_slope,
-                                                                        "force_flat_at_end": True,
-                                                                        "range_break_buffer_bps": 20.0,
-                                                                        "rebalance_interval_buckets": rebalance_interval,
-                                                                        "rebalance_mode": rebalance_mode,
-                                                                        "rebalance_anchor_drift_bps": 20.0,
-                                                                        "rebalance_vol_change_fraction": 0.25,
-                                                                        "model_gate_mode": "none",
-                                                                        "shadow_dir": "",
-                                                                    }
-                                                                )
-                                                                if len(configs) >= MAX_CONFIGS:
-                                                                    return configs
+    for index in indexes:
+        values = []
+        remaining = int(index)
+        for axis in reversed(axes):
+            values.append(axis[remaining % len(axis)])
+            remaining //= len(axis)
+        (
+            anchor_mode,
+            anchor_window,
+            entry_anchor_source,
+            recenter_mode,
+            rung_consumption_mode,
+            rung_reuse_cooldown_buckets,
+            emergency_rebalance_mode,
+            emergency_remaining_rung_threshold,
+            emergency_min_interval_buckets,
+            emergency_max_per_global_interval,
+            vol_window,
+            spacing_vol_mult,
+            min_spacing,
+            min_spacing_floor_mode,
+            max_units,
+            stop_loss,
+            stop_loss_vol_mult,
+            max_hold,
+            take_profit_spacing_mult,
+            min_take_profit_bps,
+            timeout_exit_mode,
+            cooldown,
+            anchor_distance,
+            ema_slope,
+            rebalance_interval,
+            rebalance_mode,
+        ) = reversed(values)
+        configs.append(
+            {
+                "anchor_mode": anchor_mode,
+                "entry_anchor_source": entry_anchor_source,
+                "recenter_mode": recenter_mode,
+                "rung_consumption_mode": rung_consumption_mode,
+                "rung_reuse_cooldown_buckets": rung_reuse_cooldown_buckets,
+                "emergency_rebalance_mode": emergency_rebalance_mode,
+                "emergency_remaining_rung_threshold": emergency_remaining_rung_threshold,
+                "emergency_min_interval_buckets": emergency_min_interval_buckets,
+                "emergency_max_per_global_interval": emergency_max_per_global_interval,
+                "emergency_anchor_slope_bps": 0.0,
+                "emergency_anchor_accel_bps": 0.0,
+                "emergency_disable_when_inventory_ge": max_units,
+                "emergency_disable_when_drawdown_bps": 120.0,
+                "anchor_window": anchor_window,
+                "vol_window": vol_window,
+                "spacing_mode": "volatility_scaled",
+                "vol_mult": spacing_vol_mult,
+                "spacing_vol_mult": spacing_vol_mult,
+                "rung_count": 3,
+                "take_profit_mult": take_profit_spacing_mult,
+                "take_profit_spacing_mult": take_profit_spacing_mult,
+                "min_take_profit_bps": min_take_profit_bps,
+                "min_spacing_bps": min_spacing,
+                "min_spacing_floor_mode": min_spacing_floor_mode,
+                "cost_bps": 0.1,
+                "max_open_units": max_units,
+                "stop_loss_bps": stop_loss,
+                "min_stop_floor_bps": stop_loss,
+                "stop_loss_vol_mult": stop_loss_vol_mult,
+                "max_hold_buckets": max_hold,
+                "timeout_exit_mode": timeout_exit_mode,
+                "cooldown_after_stop_buckets": cooldown,
+                "disable_buys_when_price_below_anchor_bps": anchor_distance,
+                "disable_buys_when_ema_slope_below_bps": ema_slope,
+                "force_flat_at_end": True,
+                "range_break_buffer_bps": 20.0,
+                "rebalance_interval_buckets": rebalance_interval,
+                "rebalance_mode": rebalance_mode,
+                "rebalance_anchor_drift_bps": 20.0,
+                "rebalance_vol_change_fraction": 0.25,
+                "model_gate_mode": "none",
+                "shadow_dir": "",
+            }
+        )
     return configs
 
 
@@ -182,6 +264,7 @@ def slice_result_row(config_id: int, slice_index: int, source_slice: pd.DataFram
         "final_liquidation_count": result.get("final_liquidation_count"),
         "stop_loss_net_bps": result.get("stop_loss_net_bps"),
         "timeout_net_bps": result.get("timeout_net_bps"),
+        "average_hold_buckets": result.get("average_hold_buckets"),
         "exposure_time_fraction": result.get("exposure_time_fraction"),
         "max_inventory": result.get("max_inventory"),
         "ending_inventory": result.get("ending_inventory"),
@@ -192,6 +275,32 @@ def slice_result_row(config_id: int, slice_index: int, source_slice: pd.DataFram
         "avg_spacing_to_vol_ratio": result.get("avg_spacing_to_vol_ratio"),
         "avg_stop_to_vol_ratio": result.get("avg_stop_to_vol_ratio"),
         "rebalance_count": result.get("rebalance_count"),
+        "anchor_window_seconds": result.get("anchor_window_seconds"),
+        "anchor_value_at_rebalance": result.get("anchor_value_at_rebalance"),
+        "anchor_drift_since_last_rebalance_bps": result.get("anchor_drift_since_last_rebalance_bps"),
+        "avg_anchor_drift_since_rebalance_bps": result.get("avg_anchor_drift_since_rebalance_bps"),
+        "recenter_count": result.get("recenter_count"),
+        "recenter_while_inventory_count": result.get("recenter_while_inventory_count"),
+        "recenter_blocked_by_inventory_count": result.get("recenter_blocked_by_inventory_count"),
+        "avg_anchor_distance_entry_bps": result.get("avg_anchor_distance_entry_bps"),
+        "avg_anchor_distance_exit_bps": result.get("avg_anchor_distance_exit_bps"),
+        "rung_consumed_count": result.get("rung_consumed_count"),
+        "rung_reused_count": result.get("rung_reused_count"),
+        "duplicate_rung_trigger_block_count": result.get("duplicate_rung_trigger_block_count"),
+        "consumed_rung_block_count": result.get("consumed_rung_block_count"),
+        "avg_rung_lifetime_buckets": result.get("avg_rung_lifetime_buckets"),
+        "per_rung_consumed_count": result.get("per_rung_consumed_count"),
+        "emergency_rebalance_count": result.get("emergency_rebalance_count"),
+        "emergency_rebalance_buy_side_count": result.get("emergency_rebalance_buy_side_count"),
+        "emergency_rebalance_sell_side_count": result.get("emergency_rebalance_sell_side_count"),
+        "emergency_rebalance_blocked_cooldown_count": result.get("emergency_rebalance_blocked_cooldown_count"),
+        "emergency_rebalance_blocked_inventory_count": result.get("emergency_rebalance_blocked_inventory_count"),
+        "emergency_rebalance_blocked_drawdown_count": result.get("emergency_rebalance_blocked_drawdown_count"),
+        "emergency_rebalance_blocked_slope_count": result.get("emergency_rebalance_blocked_slope_count"),
+        "emergency_rebalance_blocked_interval_count": result.get("emergency_rebalance_blocked_interval_count"),
+        "emergency_rebalance_blocked_max_per_global_count": result.get("emergency_rebalance_blocked_max_per_global_count"),
+        "avg_remaining_rungs_before_emergency": result.get("avg_remaining_rungs_before_emergency"),
+        "rungs_refreshed_by_emergency_count": result.get("rungs_refreshed_by_emergency_count"),
         "avg_rebalance_interval_buckets": result.get("avg_rebalance_interval_buckets"),
         "anchor_drift_rebalance_count": result.get("anchor_drift_rebalance_count"),
         "volatility_rebalance_count": result.get("volatility_rebalance_count"),
@@ -209,14 +318,19 @@ def classify_and_score(row: dict[str, Any]) -> tuple[str, float]:
     worst_slice = safe_float(row.get("worst_slice_net_bps"), -math.inf)
     worst_dd = safe_float(row.get("worst_drawdown_bps"), -math.inf)
     stop_ratio = safe_float(row.get("stop_loss_churn_ratio"), 1.0)
+    timeout_ratio = safe_float(row.get("timeout_churn_ratio"), 1.0)
+    timeout_net = safe_float(row.get("timeout_net_bps"), 0.0)
     exposure = safe_float(row.get("avg_exposure_time_fraction"), 0.0)
     all_flat = bool(row.get("all_slices_force_flat"))
-    if (
+    if timeout_ratio > 0.5 and total <= 0:
+        status = "reject"
+    elif (
         total > 0
         and pos_frac >= 0.75
         and cost_frac >= 0.5
         and worst_slice > -150
         and stop_ratio < 0.4
+        and timeout_ratio < 0.35
         and all_flat
     ):
         status = "stable_candidate"
@@ -230,6 +344,8 @@ def classify_and_score(row: dict[str, Any]) -> tuple[str, float]:
         + cost_frac * 250.0
         + worst_dd * 0.25
         - stop_ratio * 200.0
+        - timeout_ratio * 250.0
+        + min(timeout_net, 0.0) * 0.25
         - exposure * 100.0
     )
     return status, score
@@ -243,6 +359,8 @@ def aggregate_config(config_id: int, contract: dict[str, Any], slice_rows: list[
     tp = np.asarray([safe_float(row.get("take_profit_exit_count"), 0.0) for row in slice_rows], dtype=np.float64)
     sl = np.asarray([safe_float(row.get("stop_loss_exit_count"), 0.0) for row in slice_rows], dtype=np.float64)
     timeout = np.asarray([safe_float(row.get("timeout_exit_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    timeout_net = np.asarray([safe_float(row.get("timeout_net_bps"), 0.0) for row in slice_rows], dtype=np.float64)
+    average_hold = np.asarray([safe_float(row.get("average_hold_buckets")) for row in slice_rows], dtype=np.float64)
     exposure = np.asarray([safe_float(row.get("exposure_time_fraction"), 0.0) for row in slice_rows], dtype=np.float64)
     ending_inventory = np.asarray([safe_float(row.get("ending_inventory"), 0.0) for row in slice_rows], dtype=np.float64)
     vol_used = np.asarray([safe_float(row.get("volatility_used_fraction")) for row in slice_rows], dtype=np.float64)
@@ -251,6 +369,31 @@ def aggregate_config(config_id: int, contract: dict[str, Any], slice_rows: list[
     spacing_to_vol = np.asarray([safe_float(row.get("avg_spacing_to_vol_ratio")) for row in slice_rows], dtype=np.float64)
     stop_to_vol = np.asarray([safe_float(row.get("avg_stop_to_vol_ratio")) for row in slice_rows], dtype=np.float64)
     rebalances = np.asarray([safe_float(row.get("rebalance_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    anchor_seconds = np.asarray([safe_float(row.get("anchor_window_seconds")) for row in slice_rows], dtype=np.float64)
+    anchor_values = np.asarray([safe_float(row.get("anchor_value_at_rebalance")) for row in slice_rows], dtype=np.float64)
+    anchor_drift = np.asarray([safe_float(row.get("anchor_drift_since_last_rebalance_bps")) for row in slice_rows], dtype=np.float64)
+    avg_anchor_drift = np.asarray([safe_float(row.get("avg_anchor_drift_since_rebalance_bps")) for row in slice_rows], dtype=np.float64)
+    recenter = np.asarray([safe_float(row.get("recenter_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    recenter_inventory = np.asarray([safe_float(row.get("recenter_while_inventory_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    recenter_blocked = np.asarray([safe_float(row.get("recenter_blocked_by_inventory_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    anchor_entry = np.asarray([safe_float(row.get("avg_anchor_distance_entry_bps")) for row in slice_rows], dtype=np.float64)
+    anchor_exit = np.asarray([safe_float(row.get("avg_anchor_distance_exit_bps")) for row in slice_rows], dtype=np.float64)
+    rung_consumed = np.asarray([safe_float(row.get("rung_consumed_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    rung_reused = np.asarray([safe_float(row.get("rung_reused_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    duplicate_rung_blocks = np.asarray([safe_float(row.get("duplicate_rung_trigger_block_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    consumed_rung_blocks = np.asarray([safe_float(row.get("consumed_rung_block_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    rung_lifetime = np.asarray([safe_float(row.get("avg_rung_lifetime_buckets")) for row in slice_rows], dtype=np.float64)
+    emergency = np.asarray([safe_float(row.get("emergency_rebalance_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    emergency_buy = np.asarray([safe_float(row.get("emergency_rebalance_buy_side_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    emergency_sell = np.asarray([safe_float(row.get("emergency_rebalance_sell_side_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    emergency_cooldown = np.asarray([safe_float(row.get("emergency_rebalance_blocked_cooldown_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    emergency_inventory = np.asarray([safe_float(row.get("emergency_rebalance_blocked_inventory_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    emergency_drawdown = np.asarray([safe_float(row.get("emergency_rebalance_blocked_drawdown_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    emergency_slope = np.asarray([safe_float(row.get("emergency_rebalance_blocked_slope_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    emergency_interval = np.asarray([safe_float(row.get("emergency_rebalance_blocked_interval_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    emergency_max_global = np.asarray([safe_float(row.get("emergency_rebalance_blocked_max_per_global_count"), 0.0) for row in slice_rows], dtype=np.float64)
+    emergency_remaining = np.asarray([safe_float(row.get("avg_remaining_rungs_before_emergency")) for row in slice_rows], dtype=np.float64)
+    emergency_refreshed = np.asarray([safe_float(row.get("rungs_refreshed_by_emergency_count"), 0.0) for row in slice_rows], dtype=np.float64)
     rebalance_intervals = np.asarray([safe_float(row.get("avg_rebalance_interval_buckets")) for row in slice_rows], dtype=np.float64)
     anchor_rebalances = np.asarray([safe_float(row.get("anchor_drift_rebalance_count"), 0.0) for row in slice_rows], dtype=np.float64)
     vol_rebalances = np.asarray([safe_float(row.get("volatility_rebalance_count"), 0.0) for row in slice_rows], dtype=np.float64)
@@ -272,18 +415,46 @@ def aggregate_config(config_id: int, contract: dict[str, Any], slice_rows: list[
         "total_take_profit_exits": int(np.nansum(tp)),
         "total_stop_loss_exits": int(np.nansum(sl)),
         "total_timeout_exits": int(np.nansum(timeout)),
+        "timeout_net_bps": float(np.nansum(timeout_net)),
+        "average_hold_buckets": nanmean_or_nan(average_hold),
         "stop_loss_churn_ratio": float(np.nansum(sl) / max(total_exits, 1.0)),
         "timeout_churn_ratio": float(np.nansum(timeout) / max(total_exits, 1.0)),
         "cost_0_25_positive_slice_fraction": float(np.nanmean(cost025 > 0)),
         "all_slices_force_flat": bool(np.nanmax(ending_inventory) == 0),
         "avg_exposure_time_fraction": float(np.nanmean(exposure)),
-        "volatility_used_fraction": float(np.nanmean(vol_used)),
-        "floor_used_fraction": float(np.nanmean(floor_used)),
-        "avg_realized_vol_bps": float(np.nanmean(avg_vol)),
-        "avg_spacing_to_vol_ratio": float(np.nanmean(spacing_to_vol)),
-        "avg_stop_to_vol_ratio": float(np.nanmean(stop_to_vol)),
+        "volatility_used_fraction": nanmean_or_nan(vol_used),
+        "floor_used_fraction": nanmean_or_nan(floor_used),
+        "avg_realized_vol_bps": nanmean_or_nan(avg_vol),
+        "avg_spacing_to_vol_ratio": nanmean_or_nan(spacing_to_vol),
+        "avg_stop_to_vol_ratio": nanmean_or_nan(stop_to_vol),
         "rebalance_count": int(np.nansum(rebalances)),
-        "avg_rebalance_interval_buckets": float(np.nanmean(rebalance_intervals)),
+        "anchor_window_seconds": nanmean_or_nan(anchor_seconds),
+        "anchor_value_at_rebalance": nanmean_or_nan(anchor_values),
+        "anchor_drift_since_last_rebalance_bps": nanmean_or_nan(anchor_drift),
+        "avg_anchor_drift_since_rebalance_bps": nanmean_or_nan(avg_anchor_drift),
+        "recenter_count": int(np.nansum(recenter)),
+        "recenter_while_inventory_count": int(np.nansum(recenter_inventory)),
+        "recenter_blocked_by_inventory_count": int(np.nansum(recenter_blocked)),
+        "avg_anchor_distance_entry_bps": nanmean_or_nan(anchor_entry),
+        "avg_anchor_distance_exit_bps": nanmean_or_nan(anchor_exit),
+        "rung_consumed_count": int(np.nansum(rung_consumed)),
+        "rung_reused_count": int(np.nansum(rung_reused)),
+        "duplicate_rung_trigger_block_count": int(np.nansum(duplicate_rung_blocks)),
+        "consumed_rung_block_count": int(np.nansum(consumed_rung_blocks)),
+        "avg_rung_lifetime_buckets": nanmean_or_nan(rung_lifetime),
+        "per_rung_consumed_count": ";".join(str(row.get("per_rung_consumed_count", "")) for row in slice_rows if row.get("per_rung_consumed_count")),
+        "emergency_rebalance_count": int(np.nansum(emergency)),
+        "emergency_rebalance_buy_side_count": int(np.nansum(emergency_buy)),
+        "emergency_rebalance_sell_side_count": int(np.nansum(emergency_sell)),
+        "emergency_rebalance_blocked_cooldown_count": int(np.nansum(emergency_cooldown)),
+        "emergency_rebalance_blocked_inventory_count": int(np.nansum(emergency_inventory)),
+        "emergency_rebalance_blocked_drawdown_count": int(np.nansum(emergency_drawdown)),
+        "emergency_rebalance_blocked_slope_count": int(np.nansum(emergency_slope)),
+        "emergency_rebalance_blocked_interval_count": int(np.nansum(emergency_interval)),
+        "emergency_rebalance_blocked_max_per_global_count": int(np.nansum(emergency_max_global)),
+        "avg_remaining_rungs_before_emergency": nanmean_or_nan(emergency_remaining),
+        "rungs_refreshed_by_emergency_count": int(np.nansum(emergency_refreshed)),
+        "avg_rebalance_interval_buckets": nanmean_or_nan(rebalance_intervals),
         "anchor_drift_rebalance_count": int(np.nansum(anchor_rebalances)),
         "volatility_rebalance_count": int(np.nansum(vol_rebalances)),
         "fixed_interval_rebalance_count": int(np.nansum(fixed_rebalances)),
@@ -325,13 +496,22 @@ def write_text(path: Path, rows: list[dict[str, Any]], configs: list[dict[str, A
             f"pos={row['positive_slice_fraction']:.3f} cost025={row['cost_0_25_positive_slice_fraction']:.3f} "
             f"worst_slice={row['worst_slice_net_bps']:.3f} worst_dd={row['worst_drawdown_bps']:.3f} "
             f"sl_ratio={row['stop_loss_churn_ratio']:.3f} exposure={row['avg_exposure_time_fraction']:.3f} "
+            f"timeout_ratio={row['timeout_churn_ratio']:.3f} timeout_net={safe_float(row.get('timeout_net_bps')):.3f} avg_hold={safe_float(row.get('average_hold_buckets')):.3f} "
+            f"tp_exits={row.get('total_take_profit_exits')} timeout_exits={row.get('total_timeout_exits')} timeout_mode={row.get('timeout_exit_mode')} "
+            f"anchor_seconds={safe_float(row.get('anchor_window_seconds')):.0f} recenter={row.get('recenter_count')} "
+            f"recenter_blocked={row.get('recenter_blocked_by_inventory_count')} anchor_drift={safe_float(row.get('anchor_drift_since_last_rebalance_bps')):.3f} "
+            f"rung_consumed={row.get('rung_consumed_count')} rung_blocks={row.get('duplicate_rung_trigger_block_count')} "
+            f"emergency={row.get('emergency_rebalance_count')} emergency_rungs={row.get('rungs_refreshed_by_emergency_count')} "
             f"vol_used={safe_float(row.get('volatility_used_fraction')):.3f} floor_used={safe_float(row.get('floor_used_fraction')):.3f} "
             f"rebalances={row.get('rebalance_count')} trades_per_rebalance={safe_float(row.get('trades_per_rebalance')):.3f} "
             f"avg_vol={safe_float(row.get('avg_realized_vol_bps')):.3f} "
             f"spacing_mult={row.get('spacing_vol_mult', row.get('vol_mult'))} floor_mode={row.get('min_spacing_floor_mode')} "
             f"min_spacing={row['min_spacing_bps']} max_units={row['max_open_units']} "
             f"stop_mult={row.get('stop_loss_vol_mult')} stop_floor={row.get('min_stop_floor_bps', row.get('stop_loss_bps'))} "
-            f"hold={row['max_hold_buckets']} tp_spacing={row.get('take_profit_spacing_mult', row.get('take_profit_mult'))} cooldown={row['cooldown_after_stop_buckets']} "
+            f"hold={row['max_hold_buckets']} tp_spacing={row.get('take_profit_spacing_mult', row.get('take_profit_mult'))} min_tp={row.get('min_take_profit_bps')} cooldown={row['cooldown_after_stop_buckets']} "
+            f"anchor={row.get('anchor_mode')}:{row.get('anchor_window')} entry_anchor={row.get('entry_anchor_source')} recenter_mode={row.get('recenter_mode')} "
+            f"rung_mode={row.get('rung_consumption_mode')} "
+            f"emergency_mode={row.get('emergency_rebalance_mode')} "
             f"rebalance={row.get('rebalance_mode')}@{row.get('rebalance_interval_buckets')} "
             f"anchor_dist={row['disable_buys_when_price_below_anchor_bps']} slope={row['disable_buys_when_ema_slope_below_bps']}"
         )
@@ -360,6 +540,7 @@ def write_progress(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def main() -> int:
     sim = load_simulator_module()
+    sim.ANCHOR_WINDOWS = ANCHOR_WINDOWS
     source = sim.load_price_data(SOURCE_PATH)
     out_dir = output_dir()
     progress_path = out_dir / "sweep_progress.csv"
