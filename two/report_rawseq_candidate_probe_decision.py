@@ -65,8 +65,6 @@ def resolve_probe_dir() -> Path:
         for path in PROBE_ROOT.iterdir()
         if path.is_dir()
         and (path / "model_contract.json").exists()
-        and (path / "cost_threshold_summary.csv").exists()
-        and (path / "rolling_summary.csv").exists()
     ]
     if not candidates:
         raise SystemExit(f"No complete probe folders found under {PROBE_ROOT}")
@@ -351,11 +349,55 @@ def main() -> None:
     probe_dir = resolve_probe_dir()
     contract_path = require_file(probe_dir / "model_contract.json")
     audit_path = require_file(probe_dir / "contract_audit.csv")
-    summary_path = require_file(probe_dir / "cost_threshold_summary.csv")
-    rolling_path = require_file(probe_dir / "rolling_summary.csv")
 
     contract = load_contract(contract_path)
     audit = pd.read_csv(audit_path, low_memory=False)
+    if str(contract.get("output_label", "future_return_path")) != "future_return_path":
+        require_file(probe_dir / "label_metric_summary.csv")
+        require_file(probe_dir / "label_shape_audit.csv")
+        row = {
+            "probe_dir": str(probe_dir),
+            "decision": "label_metric_only",
+            "reasons": "direct_gt/inverse_gt trading decision is only valid for future_return_path",
+            "model_path": contract.get("model_path", ""),
+            "symbol": contract.get("symbol", ""),
+            "venue": contract.get("venue", ""),
+            "input_feature": contract.get("input_feature", ""),
+            "source_path_basename": contract.get("source_path_basename", ""),
+            "bucket_seconds": contract.get("bucket_seconds", ""),
+            "seq_len": contract.get("seq_len", ""),
+            "output_label": contract.get("output_label", ""),
+            "output_dim": contract.get("output_dim", ""),
+            "input_stride": contract.get("input_stride", "1"),
+            "output_stride": contract.get("output_stride", "1"),
+            "hidden": contract.get("hidden", ""),
+            "contract_pass": (not audit.empty) and audit["status"].astype(str).str.upper().eq("PASS").all(),
+            "decision_threshold_bps": DECISION_THRESHOLD_BPS,
+            "decision_cost_bps": DECISION_COST_BPS,
+            "selected_rows": 0,
+            "cum_net_bps": math.nan,
+            "paper_only": True,
+            "training": False,
+            "champion_mutation": False,
+            "promotion": False,
+            "orders": False,
+        }
+        text = (
+            "Rawseq Candidate Probe Decision\n\n"
+            f"Probe dir: {probe_dir}\n"
+            "Decision: label_metric_only\n"
+            f"Output label: {contract.get('output_label', '')}\n"
+            "Reason: direct_gt/inverse_gt trading decision is only valid for future_return_path.\n\n"
+            "Safety: paper-only. No training. No promotion. No champion mutation. No orders.\n"
+        )
+        (probe_dir / "decision_summary.txt").write_text(text, encoding="utf-8")
+        pd.DataFrame([row]).to_csv(probe_dir / "decision_summary.csv", index=False)
+        print(text)
+        print(f"Decision summary: {probe_dir / 'decision_summary.txt'}")
+        print(f"Decision CSV: {probe_dir / 'decision_summary.csv'}")
+        return
+    summary_path = require_file(probe_dir / "cost_threshold_summary.csv")
+    rolling_path = require_file(probe_dir / "rolling_summary.csv")
     summary = pd.read_csv(summary_path, low_memory=False)
     rolling = pd.read_csv(rolling_path, low_memory=False)
 

@@ -7,7 +7,10 @@ import importlib.util
 import json
 import math
 import os
+import multiprocessing
 import uuid
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -44,6 +47,14 @@ MAX_CONFIGS = env_int("LADDER_MAX_CONFIGS", 500, 25)
 PROGRESS_EVERY = int(float(os.getenv("LADDER_SWEEP_PROGRESS_EVERY", "25")))
 MAX_ROWS_PER_SLICE_ENV = os.getenv("LADDER_SWEEP_MAX_ROWS_PER_SLICE", "").strip()
 MAX_ROWS_PER_SLICE = int(float(MAX_ROWS_PER_SLICE_ENV)) if MAX_ROWS_PER_SLICE_ENV else 0
+STAGE_MODE = os.getenv("LADDER_SWEEP_STAGE_MODE", "off").strip().lower()
+STAGE_ROWS = int(float(os.getenv("LADDER_STAGE_ROWS", "20000")))
+STAGE_KEEP_FRACTION = float(os.getenv("LADDER_STAGE_KEEP_FRACTION", "0.25"))
+STAGE_MIN_KEEP = int(float(os.getenv("LADDER_STAGE_MIN_KEEP", "25")))
+DISABLE_DEDUPE = env_bool("LADDER_SWEEP_DISABLE_DEDUPE", False)
+WORKERS_TEXT = os.getenv("LADDER_SWEEP_WORKERS", "1").strip().lower()
+SAVE_DETAIL_TOP_N = int(float(os.getenv("LADDER_SAVE_DETAIL_TOP_N", "5")))
+RESUME_FROM_OUTPUT_DIR = os.getenv("LADDER_SWEEP_RESUME_FROM_OUTPUT_DIR", "").strip()
 SIM_PATH = PROJECT_ROOT / "scripts" / "tiny" / "simulate_path_aware_ladder_baseline.py"
 
 ANCHOR_MODES = ["ema", "rolling_ma"]
@@ -106,6 +117,10 @@ def load_simulator_module():
 
 
 def output_dir() -> Path:
+    if RESUME_FROM_OUTPUT_DIR:
+        path = Path(RESUME_FROM_OUTPUT_DIR)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     path = OUTPUT_ROOT / f"ladder_risk_walkforward_sweep_{stamp()}_{uuid.uuid4().hex[:8]}"
     path.mkdir(parents=True, exist_ok=False)
     return path
@@ -246,6 +261,119 @@ def apply_contract_globals(sim: Any, contract: dict[str, Any]) -> None:
     sim.FORCE_FLAT_AT_END = True
     sim.MODEL_GATE_MODE = "none"
     sim.SHADOW_DIR_ENV = ""
+
+
+def worker_count() -> int:
+    if WORKERS_TEXT == "auto":
+        return max(1, min(4, multiprocessing.cpu_count() or 1))
+    try:
+        return max(1, int(float(WORKERS_TEXT)))
+    except ValueError:
+        return 1
+
+
+def behavior_signature(row: dict[str, Any]) -> str:
+    fields = [
+        "classification",
+        "total_net_bps",
+        "total_trades",
+        "total_take_profit_exits",
+        "total_stop_loss_exits",
+        "total_timeout_exits",
+        "worst_drawdown_bps",
+        "timeout_churn_ratio",
+        "stop_loss_churn_ratio",
+        "emergency_rebalance_count",
+        "rungs_refreshed_by_emergency_count",
+    ]
+    parts = []
+    for field in fields:
+        value = row.get(field, "")
+        if isinstance(value, (int, str)):
+            parts.append(f"{field}={value}")
+        else:
+            parts.append(f"{field}={safe_float(value, 0.0):.6f}")
+    return "|".join(parts)
+
+
+def load_completed_ids(path: Path) -> set[int]:
+    if not path.exists():
+        return set()
+    ids: set[int] = set()
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ids.add(int(line))
+        except ValueError:
+            continue
+    return ids
+
+
+def append_completed_id(path: Path, config_id: int) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{config_id}\n")
+
+
+def simulate_one_config(args: tuple[int, dict[str, Any], list[tuple[int, pd.DataFrame, dict[str, np.ndarray]]]]) -> tuple[int, list[dict[str, Any]], dict[str, Any]]:
+    config_id, contract, slices = args
+    sim = load_simulator_module()
+    apply_contract_globals(sim, contract)
+    config_slice_rows = []
+    for slice_index, source_slice, indicators in slices:
+        result, _, _ = sim.simulate_config(source_slice, indicators, None, contract, save_paths=False)
+        config_slice_rows.append(slice_result_row(config_id, slice_index, source_slice, result))
+    return config_id, config_slice_rows, aggregate_config(config_id, contract, config_slice_rows)
+
+
+def evaluate_configs(
+    sim: Any,
+    configs: list[dict[str, Any]],
+    slices: list[tuple[int, pd.DataFrame, dict[str, np.ndarray]]],
+    out_dir: Path,
+    progress_path: Path,
+    completed_path: Path,
+    completed_ids: set[int] | None = None,
+    progress_prefix: str = "Evaluating",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    completed_ids = completed_ids or set()
+    aggregate_rows: list[dict[str, Any]] = []
+    per_slice_rows: list[dict[str, Any]] = []
+    workers = worker_count()
+    indexed = [(config_id, contract) for config_id, contract in enumerate(configs) if config_id not in completed_ids]
+    if workers > 1 and indexed:
+        tasks = [(config_id, contract, slices) for config_id, contract in indexed]
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(simulate_one_config, task): task[0] for task in tasks}
+            done = 0
+            for future in as_completed(futures):
+                config_id, config_slice_rows, aggregate = future.result()
+                per_slice_rows.extend(config_slice_rows)
+                aggregate_rows.append(aggregate)
+                append_completed_id(completed_path, config_id)
+                done += 1
+                if PROGRESS_EVERY > 0 and (done == 1 or done % PROGRESS_EVERY == 0):
+                    print(f"{progress_prefix} config {done}/{len(indexed)} with workers={workers}", flush=True)
+                    write_progress(progress_path, aggregate_rows)
+    else:
+        for done, (config_id, contract) in enumerate(indexed, start=1):
+            if PROGRESS_EVERY > 0 and (done == 1 or (done - 1) % PROGRESS_EVERY == 0):
+                print(f"{progress_prefix} config {done}/{len(indexed)}", flush=True)
+                write_progress(progress_path, aggregate_rows)
+            apply_contract_globals(sim, contract)
+            config_slice_rows = []
+            for slice_index, source_slice, indicators in slices:
+                result, _, _ = sim.simulate_config(source_slice, indicators, None, contract, save_paths=False)
+                row = slice_result_row(config_id, slice_index, source_slice, result)
+                config_slice_rows.append(row)
+                per_slice_rows.append(row)
+            aggregate_rows.append(aggregate_config(config_id, contract, config_slice_rows))
+            append_completed_id(completed_path, config_id)
+            if PROGRESS_EVERY > 0 and done % PROGRESS_EVERY == 0:
+                write_progress(progress_path, aggregate_rows)
+    write_progress(progress_path, aggregate_rows)
+    return aggregate_rows, per_slice_rows
 
 
 def slice_result_row(config_id: int, slice_index: int, source_slice: pd.DataFrame, result: dict[str, Any]) -> dict[str, Any]:
@@ -483,6 +611,14 @@ def write_text(path: Path, rows: list[dict[str, Any]], configs: list[dict[str, A
         f"Step rows: {STEP_ROWS}",
         f"Max slices: {MAX_SLICES}",
         f"Max rows per slice: {MAX_ROWS_PER_SLICE if MAX_ROWS_PER_SLICE else 'none'}",
+        f"Stage mode: {STAGE_MODE}",
+        f"Stage rows: {STAGE_ROWS}",
+        f"Stage keep fraction: {STAGE_KEEP_FRACTION}",
+        f"Stage min keep: {STAGE_MIN_KEEP}",
+        f"Dedupe disabled: {DISABLE_DEDUPE}",
+        f"Workers: {worker_count()}",
+        f"Save detail top N: {SAVE_DETAIL_TOP_N}",
+        f"Resume from output dir: {RESUME_FROM_OUTPUT_DIR or 'none'}",
         "",
         "Classification counts:",
     ]
@@ -538,12 +674,64 @@ def write_progress(path: Path, rows: list[dict[str, Any]]) -> None:
         pd.DataFrame().to_csv(path, index=False)
 
 
+def save_top_details(
+    sim: Any,
+    out_dir: Path,
+    rows: list[dict[str, Any]],
+    configs: list[dict[str, Any]],
+    slices: list[tuple[int, pd.DataFrame, dict[str, np.ndarray]]],
+) -> None:
+    if SAVE_DETAIL_TOP_N <= 0 or not rows:
+        return
+    detail_root = out_dir / "top_config_details"
+    detail_root.mkdir(parents=True, exist_ok=True)
+    manifest_rows = []
+    for rank, row in enumerate(rows[:SAVE_DETAIL_TOP_N], start=1):
+        config_id = int(row.get("config_id", -1))
+        if config_id < 0 or config_id >= len(configs):
+            continue
+        contract = configs[config_id]
+        apply_contract_globals(sim, contract)
+        config_dir = detail_root / f"rank_{rank:02d}_config_{config_id}"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        for slice_index, source_slice, indicators in slices:
+            result, trades, equity = sim.simulate_config(source_slice, indicators, None, contract, save_paths=True)
+            trades_path = config_dir / f"slice_{slice_index}_trades.csv"
+            equity_path = config_dir / f"slice_{slice_index}_equity_curve.csv"
+            summary_path = config_dir / f"slice_{slice_index}_summary.json"
+            trades.to_csv(trades_path, index=False)
+            equity.to_csv(equity_path, index=False)
+            summary_path.write_text(json.dumps(result, indent=2, sort_keys=True, default=str), encoding="utf-8")
+            manifest_rows.append(
+                {
+                    "rank": rank,
+                    "config_id": config_id,
+                    "slice_index": slice_index,
+                    "trades_path": str(trades_path),
+                    "equity_path": str(equity_path),
+                    "summary_path": str(summary_path),
+                    "paper_only": True,
+                    "orders": False,
+                    "training": False,
+                    "promotion": False,
+                    "champion_mutation": False,
+                }
+            )
+    if manifest_rows:
+        pd.DataFrame(manifest_rows).to_csv(detail_root / "top_config_detail_manifest.csv", index=False)
+
+
 def main() -> int:
+    started = time.perf_counter()
     sim = load_simulator_module()
     sim.ANCHOR_WINDOWS = ANCHOR_WINDOWS
+    sim.VOL_WINDOWS = VOL_WINDOWS
     source = sim.load_price_data(SOURCE_PATH)
     out_dir = output_dir()
     progress_path = out_dir / "sweep_progress.csv"
+    completed_path = out_dir / "completed_config_ids.txt"
+    stage_progress_path = out_dir / "stage1_sweep_progress.csv"
+    stage_completed_path = out_dir / "stage1_completed_config_ids.txt"
     slices: list[tuple[int, pd.DataFrame, dict[str, np.ndarray]]] = []
     for slice_index, start in enumerate(range(0, len(source) - SLICE_ROWS + 1, STEP_ROWS)):
         if slice_index >= MAX_SLICES:
@@ -558,22 +746,72 @@ def main() -> int:
         raise SystemExit("No walk-forward slices produced.")
 
     configs = iter_configs()
-    aggregate_rows = []
-    per_slice_rows = []
-    for config_id, contract in enumerate(configs):
-        if PROGRESS_EVERY > 0 and (config_id == 0 or config_id % PROGRESS_EVERY == 0):
-            print(f"Evaluating config {config_id + 1}/{len(configs)}", flush=True)
-            write_progress(progress_path, aggregate_rows)
-        apply_contract_globals(sim, contract)
-        config_slice_rows = []
-        for slice_index, source_slice, indicators in slices:
-            result, _, _ = sim.simulate_config(source_slice, indicators, None, contract, save_paths=False)
-            row = slice_result_row(config_id, slice_index, source_slice, result)
-            config_slice_rows.append(row)
-            per_slice_rows.append(row)
-        aggregate_rows.append(aggregate_config(config_id, contract, config_slice_rows))
-        if PROGRESS_EVERY > 0 and (config_id + 1) % PROGRESS_EVERY == 0:
-            write_progress(progress_path, aggregate_rows)
+    selected_configs = configs
+    selected_original_ids = list(range(len(configs)))
+    stage_rows: list[dict[str, Any]] = []
+    if STAGE_MODE not in {"", "off", "false", "0"}:
+        stage_slices: list[tuple[int, pd.DataFrame, dict[str, np.ndarray]]] = []
+        for slice_index, source_slice, _ in slices:
+            stage_slice = source_slice.iloc[: min(STAGE_ROWS, len(source_slice))].copy().reset_index(drop=True)
+            stage_slices.append((slice_index, stage_slice, sim.precompute_indicators(stage_slice)))
+        stage_aggregate_rows, _ = evaluate_configs(
+            sim,
+            configs,
+            stage_slices,
+            out_dir,
+            stage_progress_path,
+            stage_completed_path,
+            completed_ids=set(),
+            progress_prefix="Stage 1 evaluating",
+        )
+        for row in stage_aggregate_rows:
+            row["behavior_signature"] = behavior_signature(row)
+        stage_rows = sorted(
+            stage_aggregate_rows,
+            key=lambda row: (
+                status_priority(row["classification"]),
+                -safe_float(row.get("rank_score"), -math.inf),
+                -safe_float(row.get("total_net_bps"), -math.inf),
+            ),
+        )
+        keep_count = max(STAGE_MIN_KEEP, int(math.ceil(len(stage_rows) * STAGE_KEEP_FRACTION)))
+        keep_count = min(len(stage_rows), keep_count)
+        kept_ids: list[int] = []
+        seen_signatures: set[str] = set()
+        for row in stage_rows:
+            signature = str(row.get("behavior_signature", ""))
+            if not DISABLE_DEDUPE and signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            kept_ids.append(int(row["config_id"]))
+            if len(kept_ids) >= keep_count:
+                break
+        selected_configs = [configs[idx] for idx in kept_ids]
+        selected_original_ids = kept_ids
+        pd.DataFrame(stage_rows).to_csv(out_dir / "stage1_results.csv", index=False)
+        (out_dir / "stage1_kept_config_ids.txt").write_text("\n".join(str(idx) for idx in kept_ids) + "\n", encoding="utf-8")
+        if RESUME_FROM_OUTPUT_DIR:
+            completed_path.unlink(missing_ok=True)
+    completed_ids = load_completed_ids(completed_path) if RESUME_FROM_OUTPUT_DIR else set()
+    aggregate_rows, per_slice_rows = evaluate_configs(
+        sim,
+        selected_configs,
+        slices,
+        out_dir,
+        progress_path,
+        completed_path,
+        completed_ids=completed_ids,
+        progress_prefix="Final evaluating",
+    )
+    for row in aggregate_rows:
+        row["behavior_signature"] = behavior_signature(row)
+    if stage_rows:
+        stage_by_id = {int(row["config_id"]): row for row in stage_rows}
+        for row in aggregate_rows:
+            final_id = int(row["config_id"])
+            original_id = selected_original_ids[final_id] if final_id < len(selected_original_ids) else final_id
+            row["stage_original_config_id"] = original_id
+            row["stage_behavior_signature"] = stage_by_id.get(original_id, {}).get("behavior_signature", "")
 
     aggregate_rows = sorted(
         aggregate_rows,
@@ -604,12 +842,16 @@ def main() -> int:
     frame[frame["classification"].eq("reject")].to_csv(rejects_path, index=False)
     pd.DataFrame(per_slice_rows).to_csv(per_slice_path, index=False)
     best = aggregate_rows[0] if aggregate_rows else {}
-    best_path.write_text(json.dumps(best, indent=2, sort_keys=True), encoding="utf-8")
+    best_payload = {**best, "runtime_seconds": round(time.perf_counter() - started, 3)}
+    best_path.write_text(json.dumps(best_payload, indent=2, sort_keys=True), encoding="utf-8")
+    save_top_details(sim, out_dir, aggregate_rows, selected_configs, slices)
     write_text(text_path, aggregate_rows, configs)
 
     print("Ladder risk walk-forward sweep complete")
     print(f"Configs: {len(configs)}")
+    print(f"Configs evaluated final: {len(selected_configs)}")
     print(f"Slices: {len(slices)}")
+    print(f"Runtime seconds: {time.perf_counter() - started:.3f}")
     print(f"CSV: {sweep_path}")
     print(f"TXT: {text_path}")
     print(f"Best contract: {best_path}")

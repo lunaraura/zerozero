@@ -11,6 +11,7 @@ import json
 import math
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -22,17 +23,25 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_PATH = Path(os.getenv("POLICY_COMPARE_SOURCE_PATH", PROJECT_ROOT / "data" / "realtime" / "kraken" / "SOLUSDT_10s_flow.csv"))
 OUTPUT_ROOT = Path(os.getenv("POLICY_COMPARE_OUTPUT_DIR", PROJECT_ROOT / "data" / "research" / "policy_comparisons"))
-SLICE_ROWS = int(float(os.getenv("POLICY_COMPARE_SLICE_ROWS", "200000")))
-STEP_ROWS = int(float(os.getenv("POLICY_COMPARE_STEP_ROWS", "200000")))
-MAX_SLICES = int(float(os.getenv("POLICY_COMPARE_MAX_SLICES", "4")))
+SMOKE_MODE = os.getenv("POLICY_COMPARE_SMOKE_MODE", "").strip().lower() in {"1", "true", "yes", "y"}
+SLICE_ROWS = int(float(os.getenv("POLICY_COMPARE_SLICE_ROWS", "20000" if SMOKE_MODE else "200000")))
+STEP_ROWS = int(float(os.getenv("POLICY_COMPARE_STEP_ROWS", str(SLICE_ROWS if SMOKE_MODE else 200000))))
+MAX_SLICES = int(float(os.getenv("POLICY_COMPARE_MAX_SLICES", "2" if SMOKE_MODE else "4")))
 LADDER_CONTRACT_PATH_ENV = os.getenv("POLICY_COMPARE_LADDER_CONTRACT_PATH", "").strip()
 RAWSEQ_SHADOW_DIRS_ENV = os.getenv("POLICY_COMPARE_RAWSEQ_SHADOW_DIRS", "").strip()
 COST_BPS = float(os.getenv("POLICY_COMPARE_COST_BPS", "0.1"))
+PROGRESS_EVERY = int(float(os.getenv("POLICY_COMPARE_PROGRESS_EVERY", "1")))
+MIN_TRADE_COUNT_FOR_CANDIDATE = int(float(os.getenv("POLICY_COMPARE_MIN_TRADE_COUNT_FOR_CANDIDATE", "30")))
+MIN_POSITIVE_SLICES_FOR_CANDIDATE = int(float(os.getenv("POLICY_COMPARE_MIN_POSITIVE_SLICES_FOR_CANDIDATE", "2")))
+MIN_GATE_PASS_FRACTION_TEXT = os.getenv("POLICY_COMPARE_MIN_GATE_PASS_FRACTION", "").strip()
+MIN_GATE_PASS_FRACTION = float(MIN_GATE_PASS_FRACTION_TEXT) if MIN_GATE_PASS_FRACTION_TEXT else math.nan
 
 POLICIES = [
     "rawseq_model_only",
     "ladder_only",
-    "rawseq_gate_ladder",
+    "rawseq_gate_ladder_strict",
+    "rawseq_gate_ladder_medium",
+    "rawseq_gate_ladder_loose",
     "rawseq_suppress_ladder",
     "rawseq_emergency_filter",
 ]
@@ -169,12 +178,38 @@ def max_dip(values: np.ndarray) -> float:
     return float(np.min(cumulative - peak))
 
 
-def classify(total_net: float, positive_fraction: float, worst_slice: float, max_drawdown: float, cost025_fraction: float) -> str:
-    if not math.isfinite(total_net) or total_net <= 0:
-        return "reject"
-    if positive_fraction >= 0.75 and worst_slice > -150 and cost025_fraction >= 0.5 and max_drawdown > -2.0 * max(total_net, 1.0):
-        return "stable_candidate"
-    return "fragile_candidate"
+def classify_policy(row: dict[str, Any]) -> tuple[str, str, bool]:
+    total_net = row_metric(row, "force_flat_total_net_bps")
+    cost025 = row_metric(row, "total_net_cost_0_25_bps")
+    positive_slices = int(row_metric(row, "positive_slices"))
+    positive_fraction = row_metric(row, "positive_slice_fraction")
+    worst_slice = row_metric(row, "worst_slice_net_bps")
+    max_drawdown = row_metric(row, "max_drawdown_bps")
+    trade_count = int(row_metric(row, "trade_count"))
+    gate_pass_fraction = row_metric(row, "rawseq_gate_pass_fraction", math.nan)
+    reasons: list[str] = []
+    if trade_count < MIN_TRADE_COUNT_FOR_CANDIDATE:
+        reasons.append(f"trade_count<{MIN_TRADE_COUNT_FOR_CANDIDATE}")
+    if positive_slices < MIN_POSITIVE_SLICES_FOR_CANDIDATE:
+        reasons.append(f"positive_slices<{MIN_POSITIVE_SLICES_FOR_CANDIDATE}")
+    if math.isfinite(MIN_GATE_PASS_FRACTION) and gate_pass_fraction < MIN_GATE_PASS_FRACTION:
+        reasons.append(f"gate_pass_fraction<{MIN_GATE_PASS_FRACTION:g}")
+    if reasons:
+        return "insufficient_sample", ";".join(reasons), False
+    meaningful = True
+    drawdown_ok = max_drawdown >= -2.0 * max(total_net, 1.0)
+    if (
+        total_net > 0
+        and cost025 > 0
+        and positive_slices >= MIN_POSITIVE_SLICES_FOR_CANDIDATE
+        and positive_fraction >= 0.75
+        and worst_slice > -150
+        and drawdown_ok
+    ):
+        return "stable_candidate", "", meaningful
+    if total_net > 0:
+        return "fragile_candidate", "", meaningful
+    return "reject", "", meaningful
 
 
 def row_metric(row: dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -235,18 +270,36 @@ def rawseq_model_only(
     }
 
 
-def make_gate_fn(policy: str) -> Callable[[str, float, float, float, float], bool]:
+def gate_mode(policy: str) -> str:
+    if policy.endswith("_strict"):
+        return "strict"
+    if policy.endswith("_medium"):
+        return "medium"
+    if policy.endswith("_loose"):
+        return "loose"
+    if policy == "rawseq_suppress_ladder":
+        return "suppress_only"
+    return ""
+
+
+def make_gate_fn(policy: str, stop_loss_bps: float) -> Callable[[str, float, float, float, float], bool]:
+    mode_name = gate_mode(policy)
+
     def gate_fn(mode: str, pred_final: float, pred_max_up: float, pred_max_down: float, take_profit_bps: float) -> bool:
         if not all(math.isfinite(x) for x in [pred_final, pred_max_up, pred_max_down]):
             return False
-        stop_loss_proxy = max(2.0 * take_profit_bps, 1.0)
-        if policy == "rawseq_gate_ladder":
-            return pred_max_up >= take_profit_bps and pred_max_down >= -stop_loss_proxy and pred_final >= -0.5 * take_profit_bps
-        if policy == "rawseq_suppress_ladder":
-            danger = pred_max_down < -stop_loss_proxy or (pred_final < -0.5 * take_profit_bps and pred_max_up < take_profit_bps)
+        stop_loss_scale = max(stop_loss_bps, 2.0 * take_profit_bps, 1.0)
+        if mode_name == "strict":
+            return pred_max_up >= take_profit_bps and pred_max_down >= -stop_loss_scale and pred_final >= -0.5 * take_profit_bps
+        if mode_name == "medium":
+            return pred_max_up >= 0.75 * take_profit_bps and pred_max_down >= -1.25 * stop_loss_scale
+        if mode_name == "loose":
+            return pred_max_up >= 0.5 * take_profit_bps and pred_max_down >= -1.5 * stop_loss_scale
+        if mode_name == "suppress_only":
+            danger = pred_max_down < -1.5 * stop_loss_scale or pred_final < -1.0 * take_profit_bps
             return not danger
         if policy == "rawseq_emergency_filter":
-            danger = pred_max_down < -stop_loss_proxy or pred_final < -0.5 * take_profit_bps
+            danger = pred_max_down < -1.5 * stop_loss_scale or pred_final < -1.0 * take_profit_bps
             return not danger
         return True
 
@@ -256,6 +309,7 @@ def make_gate_fn(policy: str) -> Callable[[str, float, float, float, float], boo
 def run_ladder_policy(
     sim: Any,
     frame: pd.DataFrame,
+    indicators: dict[str, np.ndarray],
     contract: dict[str, Any],
     gate: pd.DataFrame | None,
     policy: str,
@@ -264,6 +318,7 @@ def run_ladder_policy(
     local_contract["cost_bps"] = COST_BPS
     if policy == "rawseq_emergency_filter":
         local_contract["emergency_rebalance_mode"] = "off"
+    stop_loss_bps = float(local_contract.get("stop_loss_bps") or local_contract.get("min_stop_floor_bps") or 0.0)
     original_mode = getattr(sim, "MODEL_GATE_MODE", "none")
     original_gate_fn = sim.model_gate_allows
     original_anchor_windows = list(getattr(sim, "ANCHOR_WINDOWS", []))
@@ -278,9 +333,8 @@ def run_ladder_policy(
             local_gate = None
         else:
             sim.MODEL_GATE_MODE = "policy_compare"
-            sim.model_gate_allows = make_gate_fn(policy)
+            sim.model_gate_allows = make_gate_fn(policy, stop_loss_bps)
             local_gate = gate
-        indicators = sim.precompute_indicators(frame)
         result, _, _ = sim.simulate_config(frame, indicators, local_gate, local_contract, save_paths=False)
     finally:
         sim.MODEL_GATE_MODE = original_mode
@@ -324,8 +378,7 @@ def aggregate(policy_rows: list[dict[str, Any]]) -> dict[str, Any]:
     cost025_fraction = float(np.nanmean(cost025 > 0)) if len(cost025) else math.nan
     worst = float(np.nanmin(nets)) if len(nets) else math.nan
     max_drawdown = float(np.nanmin(drawdowns)) if len(drawdowns) else math.nan
-    status = classify(total, positive_fraction, worst, max_drawdown, cost025_fraction)
-    return {
+    out = {
         "policy": policy_rows[0]["policy"] if policy_rows else "",
         "rawseq_shadow_dir": policy_rows[0].get("rawseq_shadow_dir", "") if policy_rows else "",
         "slices": len(policy_rows),
@@ -333,9 +386,11 @@ def aggregate(policy_rows: list[dict[str, Any]]) -> dict[str, Any]:
         "force_flat_total_net_bps": total,
         "total_net_cost_0_25_bps": float(np.nansum(cost025)),
         "positive_slice_fraction": positive_fraction,
+        "positive_slices": int(np.nansum(nets > 0)),
         "worst_slice_net_bps": worst,
         "max_drawdown_bps": max_drawdown,
         "trade_count": int(sum(row_metric(row, "trade_count") for row in policy_rows)),
+        "trades_per_slice": float(sum(row_metric(row, "trade_count") for row in policy_rows) / max(1, len(policy_rows))),
         "exposure_time_fraction": float(np.nanmean([row_metric(row, "exposure_time_fraction", math.nan) for row in policy_rows])),
         "take_profit_exit_count": int(sum(row_metric(row, "take_profit_exit_count") for row in policy_rows)),
         "stop_loss_exit_count": int(sum(row_metric(row, "stop_loss_exit_count") for row in policy_rows)),
@@ -347,21 +402,49 @@ def aggregate(policy_rows: list[dict[str, Any]]) -> dict[str, Any]:
         "rungs_refreshed_by_emergency_count": int(sum(row_metric(row, "rungs_refreshed_by_emergency_count") for row in policy_rows)),
         "rawseq_selected_rows": int(sum(row_metric(row, "rawseq_selected_rows") for row in policy_rows)),
         "rawseq_gate_pass_fraction": float(np.nanmean([row_metric(row, "rawseq_gate_pass_fraction", math.nan) for row in policy_rows])),
-        "policy_classification": status,
+        "min_trade_count_for_candidate": MIN_TRADE_COUNT_FOR_CANDIDATE,
     }
+    status, reason, meaningful = classify_policy(out)
+    out["policy_classification"] = status
+    out["insufficient_sample_reason"] = reason
+    out["meaningful_candidate"] = meaningful
+    out["risk_adjusted_score"] = risk_adjusted_score(out)
+    return out
+
+
+def risk_adjusted_score(row: dict[str, Any]) -> float:
+    total = row_metric(row, "force_flat_total_net_bps")
+    cost025 = row_metric(row, "total_net_cost_0_25_bps")
+    pos_frac = row_metric(row, "positive_slice_fraction")
+    worst = row_metric(row, "worst_slice_net_bps")
+    drawdown = row_metric(row, "max_drawdown_bps")
+    exposure = row_metric(row, "exposure_time_fraction")
+    trade_count = row_metric(row, "trade_count")
+    timeout_ratio = row_metric(row, "timeout_churn_ratio")
+    stop_ratio = row_metric(row, "stop_loss_churn_ratio")
+    score = total + 0.25 * cost025 + 75.0 * pos_frac + 0.25 * worst + 0.25 * drawdown
+    score += min(trade_count, MIN_TRADE_COUNT_FOR_CANDIDATE) * 0.5
+    score -= timeout_ratio * 50.0
+    score -= stop_ratio * 75.0
+    if trade_count < MIN_TRADE_COUNT_FOR_CANDIDATE:
+        score -= (MIN_TRADE_COUNT_FOR_CANDIDATE - trade_count) * 5.0
+    if exposure > 0.25:
+        score -= (exposure - 0.25) * 200.0
+    if total > 0 and drawdown < -2.0 * max(total, 1.0):
+        score -= abs(drawdown + 2.0 * max(total, 1.0)) * 0.5
+    if worst < -150:
+        score -= abs(worst + 150.0) * 0.5
+    return float(score)
 
 
 def rank_score(row: dict[str, Any]) -> float:
-    priority = {"stable_candidate": 2_000_000.0, "fragile_candidate": 1_000_000.0, "reject": 0.0}
-    return (
-        priority.get(str(row.get("policy_classification")), 0.0)
-        + row_metric(row, "force_flat_total_net_bps")
-        + row_metric(row, "total_net_cost_0_25_bps") * 0.25
-        + row_metric(row, "positive_slice_fraction") * 250.0
-        + row_metric(row, "max_drawdown_bps") * 0.5
-        - row_metric(row, "timeout_churn_ratio") * 100.0
-        - row_metric(row, "stop_loss_churn_ratio") * 100.0
-    )
+    status_bonus = {
+        "stable_candidate": 300.0,
+        "fragile_candidate": 100.0,
+        "insufficient_sample": -100.0,
+        "reject": -200.0,
+    }.get(str(row.get("policy_classification")), -200.0)
+    return status_bonus + row_metric(row, "risk_adjusted_score")
 
 
 def write_text(path: Path, summary_rows: list[dict[str, Any]], per_slice_rows: list[dict[str, Any]], meta: dict[str, Any]) -> None:
@@ -374,6 +457,12 @@ def write_text(path: Path, summary_rows: list[dict[str, Any]], per_slice_rows: l
         f"slice_rows={SLICE_ROWS}",
         f"step_rows={STEP_ROWS}",
         f"max_slices={MAX_SLICES}",
+        f"smoke_mode={SMOKE_MODE}",
+        f"progress_every={PROGRESS_EVERY}",
+        f"runtime_seconds={meta.get('runtime_seconds')}",
+        f"min_trade_count_for_candidate={MIN_TRADE_COUNT_FOR_CANDIDATE}",
+        f"min_positive_slices_for_candidate={MIN_POSITIVE_SLICES_FOR_CANDIDATE}",
+        f"min_gate_pass_fraction={MIN_GATE_PASS_FRACTION if math.isfinite(MIN_GATE_PASS_FRACTION) else 'none'}",
         f"cost_bps={COST_BPS}",
         "",
         "Safety:",
@@ -393,7 +482,9 @@ def write_text(path: Path, summary_rows: list[dict[str, Any]], per_slice_rows: l
             f"status={row.get('policy_classification')} net={row.get('force_flat_total_net_bps'):.3f} "
             f"cost025={row.get('total_net_cost_0_25_bps'):.3f} pos={row.get('positive_slice_fraction'):.3f} "
             f"worst={row.get('worst_slice_net_bps'):.3f} dd={row.get('max_drawdown_bps'):.3f} "
-            f"trades={row.get('trade_count')} gate={row.get('rawseq_gate_pass_fraction'):.3f} "
+            f"trades={row.get('trade_count')} trades_per_slice={row.get('trades_per_slice'):.3f} "
+            f"gate={row.get('rawseq_gate_pass_fraction'):.3f} meaningful={row.get('meaningful_candidate')} "
+            f"risk_score={row.get('risk_adjusted_score'):.3f} reason={row.get('insufficient_sample_reason') or 'none'} "
             f"emergency={row.get('emergency_rebalance_count')} refreshed={row.get('rungs_refreshed_by_emergency_count')}"
         )
     lines.extend(["", "Per-slice row count:", f"  {len(per_slice_rows)}"])
@@ -401,7 +492,9 @@ def write_text(path: Path, summary_rows: list[dict[str, Any]], per_slice_rows: l
         [
             "",
             "Notes:",
-            "  rawseq_gate_ladder requires predicted upside >= current take-profit, bounded downside, and no strongly adverse final prediction.",
+            "  rawseq_gate_ladder_strict requires predicted upside >= current take-profit, bounded downside, and no strongly adverse final prediction.",
+            "  rawseq_gate_ladder_medium uses 0.75x take-profit upside and 1.25x stop-loss downside tolerance.",
+            "  rawseq_gate_ladder_loose uses 0.5x take-profit upside and 1.5x stop-loss downside tolerance.",
             "  rawseq_suppress_ladder runs the ladder normally except when rawseq predicts adverse continuation.",
             "  rawseq_emergency_filter is implemented as a conservative comparison variant that disables emergency refreshes under the fixed rawseq adverse filter.",
         ]
@@ -409,7 +502,15 @@ def write_text(path: Path, summary_rows: list[dict[str, Any]], per_slice_rows: l
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_progress(path: Path, rows: list[dict[str, Any]]) -> None:
+    if rows:
+        pd.DataFrame(rows).to_csv(path, index=False)
+    else:
+        pd.DataFrame().to_csv(path, index=False)
+
+
 def main() -> int:
+    started = time.perf_counter()
     sim = load_simulator_module()
     frame = sim.load_price_data(SOURCE_PATH)
     bounds = slice_bounds(len(frame))
@@ -430,18 +531,35 @@ def main() -> int:
 
     per_slice_rows: list[dict[str, Any]] = []
     bucket_seconds = int(float(getattr(sim, "BUCKET_SECONDS", 10)))
+    progress_path = out_dir / "policy_compare_progress.csv"
+    gate_cache: dict[tuple[int, str], pd.DataFrame] = {}
+    indicator_cache: dict[int, dict[str, np.ndarray]] = {}
+    slice_cache: dict[int, pd.DataFrame] = {}
+    completed = 0
     for shadow_dir in shadows:
         threshold = selected_threshold(shadow_dir)
         for slice_index, (start, end) in enumerate(bounds):
-            source_slice = frame.iloc[start:end].reset_index(drop=True).copy()
-            gate = sim.build_shadow_gate(source_slice, shadow_dir)
+            if slice_index not in slice_cache:
+                source_slice = frame.iloc[start:end].reset_index(drop=True).copy()
+                slice_cache[slice_index] = source_slice
+                contract_anchor = int(float(contract.get("anchor_window", 300)))
+                contract_vol = int(float(contract.get("vol_window", 300)))
+                sim.ANCHOR_WINDOWS = sorted(set([*getattr(sim, "ANCHOR_WINDOWS", []), contract_anchor]))
+                sim.VOL_WINDOWS = sorted(set([*getattr(sim, "VOL_WINDOWS", []), contract_vol]))
+                indicator_cache[slice_index] = sim.precompute_indicators(source_slice)
+            source_slice = slice_cache[slice_index]
+            gate_key = (slice_index, str(shadow_dir))
+            if gate_key not in gate_cache:
+                gate_cache[gate_key] = sim.build_shadow_gate(source_slice, shadow_dir)
+            gate = gate_cache[gate_key]
+            indicators = indicator_cache[slice_index]
             start_time = source_slice["timestamp"].iloc[0] if len(source_slice) else math.nan
             end_time = source_slice["timestamp"].iloc[-1] if len(source_slice) else math.nan
             for policy in POLICIES:
                 if policy == "rawseq_model_only":
                     metrics = rawseq_model_only(source_slice, gate, threshold, COST_BPS, bucket_seconds)
                 else:
-                    ladder_result = run_ladder_policy(sim, source_slice, contract, gate, policy)
+                    ladder_result = run_ladder_policy(sim, source_slice, indicators, contract, gate, policy)
                     metrics = normalize_ladder_result(ladder_result)
                 row = {
                     "policy": policy,
@@ -465,6 +583,9 @@ def main() -> int:
                     **metrics,
                 }
                 per_slice_rows.append(row)
+                completed += 1
+                if PROGRESS_EVERY > 0 and completed % PROGRESS_EVERY == 0:
+                    write_progress(progress_path, per_slice_rows)
 
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in per_slice_rows:
@@ -484,6 +605,7 @@ def main() -> int:
         "source_path": str(SOURCE_PATH),
         "ladder_contract_path": str(contract_path),
         "rawseq_shadow_dirs": [str(path) for path in shadows],
+        "runtime_seconds": round(time.perf_counter() - started, 3),
     }
     write_text(text_path, summary_rows, per_slice_rows, meta)
     best = summary_rows[0] if summary_rows else {}
@@ -499,6 +621,7 @@ def main() -> int:
         "training": False,
         "promotion": False,
         "champion_mutation": False,
+        "runtime_seconds": round(time.perf_counter() - started, 3),
     }
     best_path.write_text(json.dumps(json_safe(best_payload), indent=2, sort_keys=True), encoding="utf-8")
 
@@ -506,6 +629,8 @@ def main() -> int:
     print(f"Wrote {per_slice_path}")
     print(f"Wrote {text_path}")
     print(f"Wrote {best_path}")
+    print(f"Wrote {progress_path}")
+    print(f"Runtime seconds: {time.perf_counter() - started:.3f}")
     print(pd.DataFrame(summary_rows).head(20).to_string(index=False))
     return 0
 

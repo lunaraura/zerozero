@@ -322,6 +322,40 @@ def main() -> None:
     probe_dir = resolve_probe_dir()
     annotated_path = require_file(probe_dir / "annotated.csv")
     contract = load_contract(require_file(probe_dir / "model_contract.json"))
+    if str(contract.get("output_label", "future_return_path")) != "future_return_path":
+        report = pd.DataFrame(
+            [
+                {
+                    "scenario": "not_applicable",
+                    "output_label": contract.get("output_label", ""),
+                    "output_dim": contract.get("output_dim", ""),
+                    "selected_rows": 0,
+                    "cum_net_bps": math.nan,
+                    "not_applicable_reason": "dynamic execution-cost trading evaluation is only valid for future_return_path",
+                    "paper_only": True,
+                    "training": False,
+                    "champion_mutation": False,
+                    "promotion": False,
+                    "orders": False,
+                }
+            ]
+        )
+        output_csv = probe_dir / "dynamic_cost_summary.csv"
+        output_txt = probe_dir / "dynamic_cost_summary.txt"
+        report.to_csv(output_csv, index=False)
+        text = (
+            "Rawseq Candidate Dynamic Cost Evaluation\n\n"
+            f"Probe dir: {probe_dir}\n"
+            f"Output label: {contract.get('output_label', '')}\n"
+            "Status: not_applicable\n"
+            "Reason: dynamic execution-cost trading evaluation is only valid for future_return_path.\n\n"
+            "Safety: paper-only. No training. No promotion. No champion mutation. No orders.\n"
+        )
+        output_txt.write_text(text, encoding="utf-8")
+        print(text)
+        print(f"Dynamic cost CSV: {output_csv}")
+        print(f"Dynamic cost text: {output_txt}")
+        return
     frame = load_test_frame(annotated_path)
     selected, gross = selected_gross(frame)
     missing_columns = [column for column in FLOW_COLUMNS if column not in frame.columns]

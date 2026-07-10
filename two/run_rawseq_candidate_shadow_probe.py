@@ -182,6 +182,7 @@ def resolve_source_path(payload: dict[str, Any], symbol: str, venue: str) -> Pat
 def extract_contract(payload: dict[str, Any], model_path: Path) -> dict[str, Any]:
     arch = payload.get("architecture") if isinstance(payload.get("architecture"), dict) else {}
     weights = payload.get("weights") if isinstance(payload.get("weights"), dict) else {}
+    y_scaler = payload.get("y_scaler") if isinstance(payload.get("y_scaler"), dict) else {}
     pop = payload.get("population_settings") if isinstance(payload.get("population_settings"), dict) else {}
 
     w1_rows, w1_cols = matrix_shape(weights.get("W1"))
@@ -192,6 +193,10 @@ def extract_contract(payload: dict[str, Any], model_path: Path) -> dict[str, Any
     venue = (safe_str(payload.get("primary_venue") or payload.get("venue")).lower() or VENUE_ENV)
     bucket_seconds = normalize_int(payload.get("bucket_seconds"))
     seq_len = normalize_int(payload.get("seq_len") or arch.get("input_dim") or w1_rows)
+    output_label = safe_str(payload.get("output_label") or payload.get("output_target") or "future_return_path").lower()
+    if output_label == "future_signed_cumulative_return_path_bps":
+        output_label = "future_return_path"
+    output_dim = normalize_int(payload.get("output_dim") or arch.get("output_dim") or w3_cols)
     input_feature = safe_str(payload.get("input_feature")).lower()
     ma_window = normalize_int(payload.get("ma_window") or payload.get("rawseq_ma_window"))
     input_stride = normalize_int(payload.get("input_stride") or payload.get("rawseq_input_stride") or 1)
@@ -215,6 +220,10 @@ def extract_contract(payload: dict[str, Any], model_path: Path) -> dict[str, Any
         "source_path_basename": source_path.name,
         "bucket_seconds": bucket_seconds,
         "seq_len": seq_len,
+        "output_label": output_label,
+        "task_type": safe_str(payload.get("task_type") or "regression"),
+        "output_dim": output_dim,
+        "label_required_horizon_buckets": normalize_int(payload.get("label_required_horizon_buckets") or seq_len),
         "input_stride": input_stride,
         "output_stride": output_stride,
         "input_span_buckets": normalize_int(
@@ -242,6 +251,8 @@ def extract_contract(payload: dict[str, Any], model_path: Path) -> dict[str, Any
         "b1_len": safe_str(vector_len(weights.get("b1"))),
         "b2_len": safe_str(vector_len(weights.get("b2"))),
         "b3_len": safe_str(vector_len(weights.get("b3"))),
+        "y_scaler_mean_len": safe_str(vector_len(y_scaler.get("mean"))),
+        "y_scaler_std_len": safe_str(vector_len(y_scaler.get("std"))),
         "seed": normalize_int(pop.get("seed") or payload.get("seed")),
         "created_at": safe_str(payload.get("created_at")),
         "best_validation_fitness": safe_str(payload.get("best_validation_fitness")),
@@ -275,7 +286,9 @@ def validate_contract(contract: dict[str, Any]) -> pd.DataFrame:
         )
 
     add("seq_len_vs_w1_rows", contract["seq_len"], contract["w1_shape"].split("x")[0])
-    add("seq_len_vs_w3_cols", contract["seq_len"], contract["w3_shape"].split("x")[-1])
+    add("output_dim_vs_w3_cols", contract["output_dim"], contract["w3_shape"].split("x")[-1])
+    if contract.get("output_label") == "future_return_path":
+        add("seq_len_vs_output_dim", contract["seq_len"], contract["output_dim"])
     add("hidden_declared_vs_inferred", contract["hidden_declared"], contract["hidden_inferred"])
     if contract["w2_shape"]:
         w2_rows, w2_cols = contract["w2_shape"].split("x", 1)
@@ -288,7 +301,11 @@ def validate_contract(contract: dict[str, Any]) -> pd.DataFrame:
     if contract["b2_len"] and "," in contract["hidden"]:
         add("hidden_2_vs_b2_len", contract["hidden"].split(",")[1], contract["b2_len"])
     if contract["b3_len"]:
-        add("seq_len_vs_b3_len", contract["seq_len"], contract["b3_len"])
+        add("output_dim_vs_b3_len", contract["output_dim"], contract["b3_len"])
+    if contract.get("y_scaler_mean_len"):
+        add("output_dim_vs_y_scaler_mean_len", contract["output_dim"], contract["y_scaler_mean_len"])
+    if contract.get("y_scaler_std_len"):
+        add("output_dim_vs_y_scaler_std_len", contract["output_dim"], contract["y_scaler_std_len"])
 
     required_fields = [
         "symbol",
@@ -300,6 +317,9 @@ def validate_contract(contract: dict[str, Any]) -> pd.DataFrame:
         "output_stride",
         "input_feature",
         "hidden",
+        "output_label",
+        "output_dim",
+        "task_type",
     ]
     for field in required_fields:
         checks.append(
@@ -323,6 +343,7 @@ def build_probe_dir(contract: dict[str, Any], model_path: Path) -> Path:
                 f"seq{contract['seq_len'] or 'unknown'}",
                 f"is{contract['input_stride'] or '1'}",
                 f"os{contract['output_stride'] or '1'}",
+                contract.get("output_label") or "future_return_path",
                 f"h{(contract['hidden'] or 'unknown').replace(',', 'x')}",
                 f"b{contract['bucket_seconds'] or 'unknown'}",
                 Path(contract["source_path_basename"]).stem or "source_unknown",
@@ -342,6 +363,8 @@ def run_inference(contract: dict[str, Any], model_path: Path, run_dir: Path) -> 
         "rows": realtime_dir / f"{symbol}_tiny_price_rawseq_path_v1_rows.csv",
         "annotated": realtime_dir / f"{symbol}_tiny_price_prediction_evaluation_rows_with_rawseq_path_v1.csv",
         "evaluation": realtime_dir / f"{symbol}_tiny_price_rawseq_path_v1_shadow_evaluation.csv",
+        "label_metric_summary": realtime_dir / f"{symbol}_tiny_price_rawseq_path_v1_label_metric_summary.csv",
+        "label_shape_audit": realtime_dir / f"{symbol}_tiny_price_rawseq_path_v1_label_shape_audit.csv",
     }
 
     env = os.environ.copy()
@@ -355,6 +378,7 @@ def run_inference(contract: dict[str, Any], model_path: Path, run_dir: Path) -> 
             "RAWSEQ_INPUT_STRIDE": contract["input_stride"],
             "RAWSEQ_OUTPUT_STRIDE": contract["output_stride"],
             "RAWSEQ_INPUT_FEATURE": contract["input_feature"],
+            "RAWSEQ_OUTPUT_LABEL": contract.get("output_label") or "future_return_path",
             "RAWSEQ_HIDDEN": contract["hidden"],
             "RAWSEQ_INCLUDE_WINDOW_GUIDE": "false",
             "RAWSEQ_INFERENCE_ONLY": "true",
@@ -432,6 +456,7 @@ def run_direct_inference(contract: dict[str, Any], model_path: Path, run_dir: Pa
         "RAWSEQ_INPUT_STRIDE": contract["input_stride"],
         "RAWSEQ_OUTPUT_STRIDE": contract["output_stride"],
         "RAWSEQ_INPUT_FEATURE": module_feature,
+        "RAWSEQ_OUTPUT_LABEL": contract.get("output_label") or "future_return_path",
         "RAWSEQ_HIDDEN": contract["hidden"],
         "RAWSEQ_INCLUDE_WINDOW_GUIDE": "false",
         "RAWSEQ_INFERENCE_ONLY": "true",
@@ -471,18 +496,29 @@ def run_direct_inference(contract: dict[str, Any], model_path: Path, run_dir: Pa
     rows, X, Y = rawseq.build_rawseq_rows(bucketed)
     rows["rawseq_input_feature"] = rawseq_feature
     rows["rawseq_payload_input_feature"] = rawseq_feature
+    rows["rawseq_output_label"] = contract.get("output_label") or "future_return_path"
 
     expected_input_dim = int(payload["architecture"]["input_dim"])
+    expected_output_dim = int(payload.get("output_dim") or payload["architecture"]["output_dim"])
     if X.shape[1] != expected_input_dim:
         raise SystemExit(
             f"Input dim mismatch. Fresh X has {X.shape[1]}, "
             f"but model expects {expected_input_dim}."
         )
+    if Y.shape[1] != expected_output_dim:
+        raise SystemExit(
+            f"Y output dim mismatch. Fresh Y has {Y.shape[1]}, but model expects {expected_output_dim}."
+        )
+    rawseq.assert_model_output_contract(model, y_scaler, expected_output_dim, "probe-direct")
 
     split = rawseq.chronological_split(len(rows))
     timestamps = rows["timestamp"].to_numpy(dtype=np.float64)
     Xs = rawseq.transform(X, x_scaler)
     pred_all_scaled, _ = rawseq.forward(model, Xs)
+    if pred_all_scaled.shape[1] != expected_output_dim:
+        raise SystemExit(
+            f"Model output dim mismatch. Predictions have {pred_all_scaled.shape[1]}, expected {expected_output_dim}."
+        )
     pred_all = rawseq.unscale_y(pred_all_scaled, y_scaler)
 
     val_eval, _ = rawseq.evaluate_model(
@@ -508,34 +544,31 @@ def run_direct_inference(contract: dict[str, Any], model_path: Path, run_dir: Pa
         max(1, int(contract["decision_horizon_seconds"]) // output_step_seconds),
         int(contract["seq_len"]),
     ) - 1
-    annotated = rows.copy()
-    annotated["rawseq_path_pred_horizon_return_bps"] = pred_all[:, horizon_idx]
-    annotated["rawseq_path_actual_horizon_return_bps"] = Y[:, horizon_idx]
-    annotated["rawseq_path_allowed_gt_0"] = annotated["rawseq_path_pred_horizon_return_bps"] > 0.0
-    annotated["rawseq_path_allowed_gt_1"] = annotated["rawseq_path_pred_horizon_return_bps"] > 1.0
-    annotated["rawseq_path_allowed_gt_2"] = annotated["rawseq_path_pred_horizon_return_bps"] > 2.0
-
-    bucket_seconds = int(contract["bucket_seconds"])
-    output_stride = int_contract(contract, "output_stride")
-    seq_len = int(contract["seq_len"])
-    for seconds in [1, 5, 10, 15, 30, 60, 120, 300]:
-        idx = seconds // (bucket_seconds * output_stride) - 1
-        if 0 <= idx < seq_len:
-            annotated[f"rawseq_pred_fwd_{seconds}s_bps"] = pred_all[:, idx]
-            annotated[f"rawseq_actual_fwd_{seconds}s_bps"] = Y[:, idx]
+    annotated = rawseq.add_label_annotation_columns(rows.copy(), pred_all, Y)
+    label_metrics = pd.DataFrame(
+        rawseq.label_metric_rows(Y[split.val], pred_all[split.val], "validation_probe_inference_only")
+        + rawseq.label_metric_rows(Y[split.test], pred_all[split.test], "test_probe_inference_only")
+    )
+    label_audit = pd.DataFrame(rawseq.label_shape_audit_rows(Y, pred_all, y_scaler, "probe_direct"))
 
     artifacts = {
         "rows": run_dir / "rows.csv",
         "annotated": run_dir / "annotated.csv",
         "evaluation": run_dir / "evaluation.csv",
+        "label_metric_summary": run_dir / "label_metric_summary.csv",
+        "label_shape_audit": run_dir / "label_shape_audit.csv",
     }
     rows.to_csv(artifacts["rows"], index=False)
     annotated.to_csv(artifacts["annotated"], index=False)
     evaluation.to_csv(artifacts["evaluation"], index=False)
+    label_metrics.to_csv(artifacts["label_metric_summary"], index=False)
+    label_audit.to_csv(artifacts["label_shape_audit"], index=False)
     with (run_dir / "run.log").open("a", encoding="utf-8") as log:
         log.write(f"Probe direct rows: {artifacts['rows']}\n")
         log.write(f"Probe direct annotated: {artifacts['annotated']}\n")
         log.write(f"Probe direct evaluation: {artifacts['evaluation']}\n")
+        log.write(f"Probe direct label metrics: {artifacts['label_metric_summary']}\n")
+        log.write(f"Probe direct label shape audit: {artifacts['label_shape_audit']}\n")
         log.write("Probe direct inference complete: no training, no promotion, no orders.\n")
     return artifacts
 
@@ -603,6 +636,9 @@ def build_cost_threshold_summary(
                     "source_path_basename": contract["source_path_basename"],
                     "bucket_seconds": contract["bucket_seconds"],
                     "seq_len": contract["seq_len"],
+                    "output_label": contract.get("output_label", ""),
+                    "output_dim": contract.get("output_dim", ""),
+                    "task_type": contract.get("task_type", ""),
                     "input_stride": contract["input_stride"],
                     "output_stride": contract["output_stride"],
                     "hidden": contract["hidden"],
@@ -656,6 +692,9 @@ def build_rolling_summary(
                             "source_path_basename": contract["source_path_basename"],
                             "bucket_seconds": contract["bucket_seconds"],
                             "seq_len": contract["seq_len"],
+                            "output_label": contract.get("output_label", ""),
+                            "output_dim": contract.get("output_dim", ""),
+                            "task_type": contract.get("task_type", ""),
                             "input_stride": contract["input_stride"],
                             "output_stride": contract["output_stride"],
                             "hidden": contract["hidden"],
@@ -676,6 +715,48 @@ def build_rolling_summary(
                             "max_dip_net_bps": max_dip_bps(net),
                         }
                     )
+    return pd.DataFrame(rows)
+
+
+def build_label_policy_placeholder(contract: dict[str, Any], thresholds: list[float], costs: list[float], annotated_path: Path) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for threshold in thresholds:
+        for cost in costs:
+            rows.append(
+                {
+                    "symbol": contract["symbol"],
+                    "venue": contract["venue"],
+                    "model_path": contract["model_path"],
+                    "input_feature": contract["input_feature"],
+                    "source_path_basename": contract["source_path_basename"],
+                    "bucket_seconds": contract["bucket_seconds"],
+                    "seq_len": contract["seq_len"],
+                    "output_label": contract.get("output_label", ""),
+                    "output_dim": contract.get("output_dim", ""),
+                    "task_type": contract.get("task_type", ""),
+                    "input_stride": contract["input_stride"],
+                    "output_stride": contract["output_stride"],
+                    "hidden": contract["hidden"],
+                    "policy": "label_specific_metrics_only",
+                    "threshold_bps": threshold,
+                    "cost_bps": cost,
+                    "test_frac": TEST_FRAC,
+                    "selected_rows": 0,
+                    "avg_gross_bps": math.nan,
+                    "avg_net_bps": math.nan,
+                    "cum_gross_bps": math.nan,
+                    "cum_net_bps": math.nan,
+                    "win_rate_gross": math.nan,
+                    "win_rate_net": math.nan,
+                    "max_dip_gross_bps": math.nan,
+                    "max_dip_net_bps": math.nan,
+                    "annotated_path": str(annotated_path),
+                    "not_applicable_reason": "direct_gt/inverse_gt trading evaluation is only valid for future_return_path",
+                    "paper_only": True,
+                    "orders": False,
+                    "promotion": False,
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -718,6 +799,10 @@ def render_text(
         f"  source_path: {contract['source_path']}",
         f"  bucket_seconds: {contract['bucket_seconds']}",
         f"  seq_len: {contract['seq_len']}",
+        f"  output_label: {contract.get('output_label', '')}",
+        f"  task_type: {contract.get('task_type', '')}",
+        f"  output_dim: {contract.get('output_dim', '')}",
+        f"  label_required_horizon_buckets: {contract.get('label_required_horizon_buckets', '')}",
         f"  input_stride: {contract['input_stride']} (span {contract['input_span_seconds']}s)",
         f"  output_stride: {contract['output_stride']} (span {contract['output_span_seconds']}s)",
         f"  input_feature: {contract['input_feature']}",
@@ -733,6 +818,8 @@ def render_text(
         f"  rows: {artifacts.get('rows', '')}",
         f"  annotated: {artifacts.get('annotated', '')}",
         f"  evaluation: {artifacts.get('evaluation', '')}",
+        f"  label_metric_summary: {artifacts.get('label_metric_summary', '')}",
+        f"  label_shape_audit: {artifacts.get('label_shape_audit', '')}",
         "",
         "Contract Audit",
         f"  status: {audit_status}",
@@ -750,6 +837,8 @@ def render_text(
         f"  costs: {COST_BPS_LIST_ENV}",
         f"  test_frac: {TEST_FRAC:g}",
     ]
+    if contract.get("output_label", "future_return_path") != "future_return_path":
+        lines.append("  not_applicable: direct_gt/inverse_gt trading grids are skipped for high/low/envelope labels.")
     if base_row is not None:
         lines.append(
             "  threshold=0.3 cost=0.1: "
@@ -818,12 +907,16 @@ def main() -> None:
     audit.to_csv(run_dir / "contract_audit.csv", index=False)
 
     artifacts = run_inference(contract, model_path, run_dir)
-    test = load_test_frame(artifacts["annotated"])
     thresholds = parse_float_list(THRESHOLD_BPS_LIST_ENV, "RAWSEQ_PROBE_THRESHOLD_BPS_LIST")
     costs = parse_float_list(COST_BPS_LIST_ENV, "RAWSEQ_PROBE_COST_BPS_LIST")
 
-    cost_summary = build_cost_threshold_summary(test, contract, thresholds, costs, artifacts["annotated"])
-    rolling = build_rolling_summary(test, contract, thresholds, costs)
+    if contract.get("output_label", "future_return_path") == "future_return_path":
+        test = load_test_frame(artifacts["annotated"])
+        cost_summary = build_cost_threshold_summary(test, contract, thresholds, costs, artifacts["annotated"])
+        rolling = build_rolling_summary(test, contract, thresholds, costs)
+    else:
+        cost_summary = build_label_policy_placeholder(contract, thresholds, costs, artifacts["annotated"])
+        rolling = pd.DataFrame()
     cost_summary.to_csv(run_dir / "cost_threshold_summary.csv", index=False)
     rolling.to_csv(run_dir / "rolling_summary.csv", index=False)
 

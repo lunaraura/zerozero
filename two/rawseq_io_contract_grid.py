@@ -28,6 +28,7 @@ INPUT_STRIDES = os.getenv("RAWSEQ_IO_INPUT_STRIDES", "1,3,6")
 OUTPUT_STRIDES = os.getenv("RAWSEQ_IO_OUTPUT_STRIDES", "1,3,6")
 INPUT_FEATURES = os.getenv("RAWSEQ_IO_INPUT_FEATURES", "return,ma_distance")
 MA_WINDOWS = os.getenv("RAWSEQ_IO_MA_WINDOWS", "60,150")
+FEATURE_WINDOWS = os.getenv("RAWSEQ_IO_FEATURE_WINDOWS", MA_WINDOWS)
 HIDDENS = os.getenv("RAWSEQ_IO_HIDDENS", "2,2;3,3;4,4")
 OUTPUT_LABELS = os.getenv("RAWSEQ_IO_OUTPUT_LABELS", "future_return_path")
 OUTPUT_DIR_TEXT = os.getenv(
@@ -37,7 +38,13 @@ OUTPUT_DIR_TEXT = os.getenv(
 
 BASE_SOURCE_COLUMNS = ["timestamp", "price"]
 OPTIONAL_SOURCE_COLUMNS = ["time", "predicted_side"]
-SUPPORTED_INPUT_FEATURES = {"return", "ma_distance", "ma_slope"}
+WINDOWED_INPUT_FEATURES = {
+    "rolling_range_bps",
+    "rolling_volatility_bps",
+    "distance_to_recent_high_bps",
+    "distance_to_recent_low_bps",
+}
+SUPPORTED_INPUT_FEATURES = {"return", "ma_distance", "ma_slope", *WINDOWED_INPUT_FEATURES}
 ALLOWED_OUTPUT_LABELS = {
     "future_return_path",
     "future_high_from_now_bps_path",
@@ -118,6 +125,7 @@ def required_columns(input_feature: str) -> list[str]:
 def support_status(
     input_feature: str,
     ma_window: str,
+    feature_window: str,
     output_label: str,
     hidden: str,
     seq_len: int,
@@ -132,6 +140,8 @@ def support_status(
         reasons.append(f"unsupported_output_label={output_label}")
     if input_feature in {"ma_distance", "ma_slope"} and not ma_window:
         reasons.append("ma_window_required")
+    if input_feature in WINDOWED_INPUT_FEATURES and not feature_window:
+        reasons.append("feature_window_required")
     if input_feature == "return" and ma_window:
         reasons.append("ma_window_ignored_for_return")
     h_parts = hidden.split(",")
@@ -160,6 +170,7 @@ def contract_slug(
     venue: str,
     input_feature: str,
     ma_window: str,
+    feature_window: str,
     hidden: str,
     seq_len: int,
     bucket_seconds: int,
@@ -167,7 +178,7 @@ def contract_slug(
     output_stride: int,
     output_label: str,
 ) -> str:
-    ma_part = f"ma{ma_window}" if ma_window else "maNA"
+    ma_part = f"ma{ma_window}" if ma_window else (f"fw{feature_window}" if feature_window else "maNA")
     hidden_part = "h" + hidden.replace(",", "x")
     return safe_slug(
         "_".join(
@@ -194,6 +205,7 @@ def build_rows() -> list[dict[str, Any]]:
     output_strides = parse_csv_ints(OUTPUT_STRIDES, "RAWSEQ_IO_OUTPUT_STRIDES")
     input_features = parse_csv_strings(INPUT_FEATURES)
     ma_windows = parse_csv_ints(MA_WINDOWS, "RAWSEQ_IO_MA_WINDOWS")
+    feature_windows = parse_csv_ints(FEATURE_WINDOWS, "RAWSEQ_IO_FEATURE_WINDOWS")
     hiddens = parse_hiddens(HIDDENS)
     output_labels = parse_csv_strings(OUTPUT_LABELS)
     label_registry = load_label_registry(max(seq_lens))
@@ -203,15 +215,17 @@ def build_rows() -> list[dict[str, Any]]:
         for input_stride in input_strides:
             for output_stride in output_strides:
                 for input_feature in input_features:
-                    feature_ma_windows: list[str]
+                    feature_window_pairs: list[tuple[str, str]]
                     if input_feature in {"ma_distance", "ma_slope"}:
-                        feature_ma_windows = [str(value) for value in ma_windows]
+                        feature_window_pairs = [(str(value), str(value)) for value in ma_windows]
+                    elif input_feature in WINDOWED_INPUT_FEATURES:
+                        feature_window_pairs = [("", str(value)) for value in feature_windows]
                     else:
-                        feature_ma_windows = [""]
-                    for ma_window in feature_ma_windows:
+                        feature_window_pairs = [("", "")]
+                    for ma_window, feature_window in feature_window_pairs:
                         for hidden in hiddens:
                             for output_label in output_labels:
-                                status, reason = support_status(input_feature, ma_window, output_label, hidden, seq_len, label_registry)
+                                status, reason = support_status(input_feature, ma_window, feature_window, output_label, hidden, seq_len, label_registry)
                                 meta = label_meta(label_registry, output_label)
                                 rows.append(
                                     {
@@ -220,6 +234,7 @@ def build_rows() -> list[dict[str, Any]]:
                                             VENUE,
                                             input_feature,
                                             ma_window,
+                                            feature_window,
                                             hidden,
                                             seq_len,
                                             BUCKET_SECONDS,
@@ -237,6 +252,7 @@ def build_rows() -> list[dict[str, Any]]:
                                         "output_stride": output_stride,
                                         "input_feature": input_feature,
                                         "ma_window": ma_window,
+                                        "feature_window": feature_window,
                                         "hidden": hidden,
                                         "output_label": output_label,
                                         "task_type": meta["task_type"],
