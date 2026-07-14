@@ -1,0 +1,18 @@
+{
+  "schema_name": "rawseq_feature_groups",
+  "schema_version": "1.0.0",
+  "generator_path": "scripts/tiny/rawseq_feature_label_registry.py",
+  "paper_only": true,
+  "orders": false,
+  "promotion": false,
+  "champion_mutation": false,
+  "feature_groups": [
+    {"feature_group": "raw", "families": ["raw"], "description": "Raw returns/ranges/current bucket features."},
+    {"feature_group": "raw_trend", "families": ["raw", "trend", "regime"], "description": "Raw plus trend/regime features."},
+    {"feature_group": "raw_momentum", "families": ["raw", "momentum", "regime"], "description": "Raw plus momentum/regime features."},
+    {"feature_group": "raw_volatility", "families": ["raw", "volatility", "regime"], "description": "Raw plus volatility/regime features."},
+    {"feature_group": "raw_volume", "families": ["raw", "volume", "trade_flow", "regime"], "description": "Raw plus volume/trade-flow/regime features."},
+    {"feature_group": "raw_cross_market", "families": ["raw", "cross_market", "regime"], "description": "Raw plus backward-asof BTC/ETH context."},
+    {"feature_group": "all", "families": ["raw", "trend", "momentum", "volatility", "breakout", "volume", "trade_flow", "order_book", "liquidity", "regime", "cross_market", "quality"], "description": "All currently exported feature families."}
+  ]
+}
