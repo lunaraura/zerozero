@@ -98,6 +98,15 @@ def nearest_row(frame: pd.DataFrame, threshold: float, cost: float) -> pd.Series
     return subset.iloc[0]
 
 
+def optional_frame(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path, low_memory=False)
+    except Exception:
+        return pd.DataFrame()
+
+
 def ratio(numerator: float, denominator: float) -> float:
     numerator = safe_float(numerator)
     denominator = safe_float(denominator)
@@ -238,7 +247,10 @@ def decide(
         and not cost_025_strong_negative
     )
     if clean:
-        return "clean_champion_candidate", ["all clean champion candidate gates passed"]
+        return "research_candidate", [
+            "historical probe clean gates passed",
+            "untouched holdout or true forward-paper evaluation required before clean status",
+        ]
 
     reasons.extend(research_flags)
     if selected_rows < MIN_SELECTED_ROWS:
@@ -260,6 +272,8 @@ def render_text(
     roll: dict[str, dict[str, Any]],
     cost_rows: list[dict[str, Any]],
     threshold_rows: list[dict[str, Any]],
+    non_overlap_row: pd.Series | None = None,
+    position_row: pd.Series | None = None,
 ) -> str:
     selected_rows = safe_int(decision_row["selected_rows"]) if decision_row is not None else 0
     avg_gross = safe_float(decision_row["avg_gross_bps"]) if decision_row is not None else math.nan
@@ -333,6 +347,42 @@ def render_text(
             f"win={fmt_float(row['win_rate_net'])}"
         )
 
+    lines += ["", "Non-Overlapping Decision Metrics"]
+    if non_overlap_row is None:
+        lines.append("  missing: non_overlapping_decision_metrics artifact not found")
+    else:
+        lines.append(
+            "  "
+            f"selected_rows={safe_int(non_overlap_row.get('selected_rows'))} "
+            f"avg_net={fmt_float(non_overlap_row.get('avg_net_bps'))} "
+            f"cum_net={fmt_float(non_overlap_row.get('cum_net_bps'))} "
+            f"win={fmt_float(non_overlap_row.get('win_rate_net'))} "
+            f"max_dip={fmt_float(non_overlap_row.get('max_dip_net_bps'))} "
+            f"ci95=[{fmt_float(non_overlap_row.get('avg_net_ci95_low_bps'))},"
+            f"{fmt_float(non_overlap_row.get('avg_net_ci95_high_bps'))}]"
+        )
+
+    lines += ["", "Position Simulation Metrics"]
+    if position_row is None:
+        lines.append("  missing: position_sim_metrics artifact not found")
+    else:
+        lines.append(
+            "  "
+            f"trade_count={safe_int(position_row.get('trade_count'))} "
+            f"avg_net={fmt_float(position_row.get('avg_net_bps'))} "
+            f"cum_net={fmt_float(position_row.get('cum_net_bps'))} "
+            f"win={fmt_float(position_row.get('win_rate_net'))} "
+            f"max_dip={fmt_float(position_row.get('max_dip_net_bps'))} "
+            f"exposure={fmt_float(position_row.get('exposure_time_fraction'))}"
+        )
+
+    lines += [
+        "",
+        "Evidence Classification",
+        "  selection_stage: test_selected",
+        "  evidence_class: fragile_research_signal unless untouched holdout or true forward-paper survives",
+    ]
+
     lines += [
         "",
         "Safety",
@@ -400,12 +450,16 @@ def main() -> None:
     rolling_path = require_file(probe_dir / "rolling_summary.csv")
     summary = pd.read_csv(summary_path, low_memory=False)
     rolling = pd.read_csv(rolling_path, low_memory=False)
+    non_overlap = optional_frame(probe_dir / "non_overlapping_decision_metrics.csv")
+    position_sim = optional_frame(probe_dir / "position_sim_metrics.csv")
 
     contract_pass = (not audit.empty) and audit["status"].astype(str).str.upper().eq("PASS").all()
     decision_row = nearest_row(summary, DECISION_THRESHOLD_BPS, DECISION_COST_BPS)
     roll = rolling_metrics(rolling, DECISION_THRESHOLD_BPS, DECISION_COST_BPS)
     cost_rows, threshold_rows = sensitivity_rows(summary, DECISION_THRESHOLD_BPS)
     decision, reasons = decide(contract_pass, decision_row, roll, cost_rows)
+    non_overlap_row = nearest_row(non_overlap, DECISION_THRESHOLD_BPS, DECISION_COST_BPS) if not non_overlap.empty else None
+    position_row = nearest_row(position_sim, DECISION_THRESHOLD_BPS, DECISION_COST_BPS) if not position_sim.empty else None
 
     selected_rows = safe_int(decision_row["selected_rows"]) if decision_row is not None else 0
     cum_net = safe_float(decision_row["cum_net_bps"]) if decision_row is not None else math.nan
@@ -435,7 +489,24 @@ def main() -> None:
         "win_rate_net": safe_float(decision_row["win_rate_net"]) if decision_row is not None else math.nan,
         "max_dip_net_bps": max_dip,
         "max_dip_to_cum_net_ratio": dip_to_cum_ratio(max_dip, cum_net),
+        "selection_stage": "test_selected",
+        "evidence_class": "fragile_research_signal" if decision != "reject" else "rejected_research_signal",
     }
+    if non_overlap_row is not None:
+        row["non_overlapping_selected_rows"] = safe_int(non_overlap_row.get("selected_rows"))
+        row["non_overlapping_avg_net_bps"] = safe_float(non_overlap_row.get("avg_net_bps"))
+        row["non_overlapping_cum_net_bps"] = safe_float(non_overlap_row.get("cum_net_bps"))
+        row["non_overlapping_win_rate_net"] = safe_float(non_overlap_row.get("win_rate_net"))
+        row["non_overlapping_max_dip_net_bps"] = safe_float(non_overlap_row.get("max_dip_net_bps"))
+        row["non_overlapping_avg_net_ci95_low_bps"] = safe_float(non_overlap_row.get("avg_net_ci95_low_bps"))
+        row["non_overlapping_avg_net_ci95_high_bps"] = safe_float(non_overlap_row.get("avg_net_ci95_high_bps"))
+    if position_row is not None:
+        row["position_trade_count"] = safe_int(position_row.get("trade_count"))
+        row["position_avg_net_bps"] = safe_float(position_row.get("avg_net_bps"))
+        row["position_cum_net_bps"] = safe_float(position_row.get("cum_net_bps"))
+        row["position_win_rate_net"] = safe_float(position_row.get("win_rate_net"))
+        row["position_max_dip_net_bps"] = safe_float(position_row.get("max_dip_net_bps"))
+        row["position_exposure_time_fraction"] = safe_float(position_row.get("exposure_time_fraction"))
     for window in WINDOWS_TO_COMPARE:
         key = f"{window:g}h"
         item = roll.get(key, {})
@@ -465,6 +536,8 @@ def main() -> None:
         roll,
         cost_rows,
         threshold_rows,
+        non_overlap_row,
+        position_row,
     )
     (probe_dir / "decision_summary.txt").write_text(text, encoding="utf-8")
     pd.DataFrame([row]).to_csv(probe_dir / "decision_summary.csv", index=False)

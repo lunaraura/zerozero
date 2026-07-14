@@ -54,6 +54,19 @@ INPUT_STRIDES = os.getenv("RAWSEQ_WF_INPUT_STRIDES", os.getenv("RAWSEQ_INPUT_STR
 OUTPUT_STRIDES = os.getenv("RAWSEQ_WF_OUTPUT_STRIDES", os.getenv("RAWSEQ_OUTPUT_STRIDE", "1"))
 OUTPUT_LABELS = os.getenv("RAWSEQ_WF_OUTPUT_LABELS", os.getenv("RAWSEQ_OUTPUT_LABEL", "future_return_path"))
 
+
+def parse_int_values(text: str, default: int = 1) -> list[int]:
+    values: list[int] = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(max(1, int(float(part))))
+        except Exception:
+            continue
+    return values or [default]
+
 TRAIN_ROWS = int(os.getenv("RAWSEQ_WF_TRAIN_ROWS", "60000"))
 VALIDATION_ROWS = int(os.getenv("RAWSEQ_WF_VALIDATION_ROWS", "15000"))
 TEST_ROWS = int(os.getenv("RAWSEQ_WF_TEST_ROWS", "15000"))
@@ -70,6 +83,18 @@ DECISION_HORIZON_SECONDS = int(
 )
 DECISION_THRESHOLD_BPS = float(
     os.getenv("RAWSEQ_WF_DECISION_THRESHOLD_BPS", os.getenv("RAWSEQ_DECISION_THRESHOLD_BPS", "0.0"))
+)
+PURGE_ROWS = int(
+    os.getenv(
+        "RAWSEQ_WF_PURGE_ROWS",
+        str(SEQ_LEN * max(parse_int_values(INPUT_STRIDES, 1))),
+    )
+)
+EMBARGO_ROWS = int(
+    os.getenv(
+        "RAWSEQ_WF_EMBARGO_ROWS",
+        str(SEQ_LEN * max(parse_int_values(OUTPUT_STRIDES, 1))),
+    )
 )
 FITNESS_POLICY = os.getenv("RAWSEQ_WF_FITNESS_POLICY", os.getenv("RAWSEQ_FITNESS_POLICY", "direct_gt"))
 FITNESS_THRESHOLD_BPS = float(
@@ -92,6 +117,7 @@ SHORT_PATHS = os.getenv("RAWSEQ_WF_SHORT_PATHS", "true" if IS_WINDOWS else "fals
     "on",
 }
 WINDOWS_SAFE_PATH_LIMIT = 220
+WINDOWS_MAX_PATH_LENGTH = int(float(os.getenv("RAWSEQ_WF_MAX_PATH_LENGTH", os.getenv("RAWSEQ_IO_DISCOVERY_MAX_PATH_LENGTH", "240"))))
 MAX_PATH_COMPONENT_LEN = 64
 OUTPUT_LABEL_TOKENS = {
     "future_return_path": "frp",
@@ -131,6 +157,12 @@ class WindowSpec:
     validation_end: int
     test_start: int
     test_end: int
+    purge_rows: int
+    embargo_rows: int
+    validation_purge_start: int
+    validation_embargo_start: int
+    test_purge_start: int
+    test_embargo_start: int
 
 
 @dataclass(frozen=True)
@@ -309,7 +341,9 @@ def timestamp_bounds(frame: pd.DataFrame) -> tuple[str, str]:
 
 
 def build_windows(total_rows: int) -> list[WindowSpec]:
-    window_rows = TRAIN_ROWS + VALIDATION_ROWS + TEST_ROWS
+    purge_rows = max(0, PURGE_ROWS)
+    embargo_rows = max(0, EMBARGO_ROWS)
+    window_rows = TRAIN_ROWS + embargo_rows + purge_rows + VALIDATION_ROWS + embargo_rows + purge_rows + TEST_ROWS
     if window_rows <= 0:
         raise SystemExit("Train/validation/test row counts must sum to a positive number.")
     if STEP_ROWS <= 0:
@@ -321,9 +355,11 @@ def build_windows(total_rows: int) -> list[WindowSpec]:
     while start + window_rows <= total_rows and len(windows) < MAX_WINDOWS:
         train_start = start
         train_end = train_start + TRAIN_ROWS
-        validation_start = train_end
+        validation_purge_start = train_end + embargo_rows
+        validation_start = validation_purge_start + purge_rows
         validation_end = validation_start + VALIDATION_ROWS
-        test_start = validation_end
+        test_purge_start = validation_end + embargo_rows
+        test_start = test_purge_start + purge_rows
         test_end = test_start + TEST_ROWS
         windows.append(
             WindowSpec(
@@ -336,6 +372,12 @@ def build_windows(total_rows: int) -> list[WindowSpec]:
                 validation_end=validation_end,
                 test_start=test_start,
                 test_end=test_end,
+                purge_rows=purge_rows,
+                embargo_rows=embargo_rows,
+                validation_purge_start=validation_purge_start,
+                validation_embargo_start=train_end,
+                test_purge_start=test_purge_start,
+                test_embargo_start=validation_end,
             )
         )
         start += STEP_ROWS
@@ -477,13 +519,48 @@ def projected_path_metrics(archive_dir: Path) -> dict[str, Any]:
     longest_artifact = max(final_paths, key=path_length)
     longest_temp = max(temp_paths, key=path_length)
     longest = max(final_paths + temp_paths, key=path_length)
+    longest_temp_length = path_length(longest_temp)
+    guard_pass = (not IS_WINDOWS) or longest_temp_length < WINDOWS_MAX_PATH_LENGTH
+    guard_reason = "" if guard_pass else (
+        f"projected_longest_temp_path_length={longest_temp_length} "
+        f">= max_allowed_path_length={WINDOWS_MAX_PATH_LENGTH}"
+    )
     return {
         "projected_candidate_dir_length": path_length(archive_dir),
         "projected_longest_artifact_path_length": path_length(longest_artifact),
         "projected_longest_temp_path_length": path_length(longest_temp),
+        "projected_longest_artifact_path": str(longest_artifact),
+        "projected_longest_temp_path": str(longest_temp),
         "projected_longest_path": str(longest),
-        "windows_path_guard_pass": (not IS_WINDOWS) or path_length(longest_temp) < 240,
+        "windows_path_guard_pass": guard_pass,
+        "attempted_path": str(longest_temp),
+        "attempted_path_length": longest_temp_length,
+        "max_allowed_path_length": WINDOWS_MAX_PATH_LENGTH,
+        "path_guard_reason": guard_reason,
     }
+
+
+def trainer_failure_status(archive_dir: Path, completed: subprocess.CompletedProcess[str] | None) -> str:
+    if completed is None or completed.returncode == 0:
+        return ""
+    text = ""
+    run_log = archive_dir / "run.log"
+    if run_log.exists():
+        try:
+            text = run_log.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            text = ""
+    lower = text.lower()
+    if "path_guard_failed" in lower or "windows path guard" in lower:
+        return "PATH_GUARD_FAILED"
+    if (
+        "no rawseq rows built" in lower
+        or "source rows loaded: 0" in lower
+        or "source_path does not exist" in lower
+        or "has no rows" in lower
+    ):
+        return "DATA_FAILED"
+    return "TRAIN_FAILED"
 
 
 def compact_run_id(run_id: str) -> str:
@@ -496,11 +573,18 @@ def compact_run_id(run_id: str) -> str:
 
 def write_window_source(source: pd.DataFrame, window: WindowSpec, path: Path) -> pd.DataFrame:
     slice_frame = source.iloc[window.train_start : window.test_end].copy()
-    slice_frame["rawseq_wf_split"] = "train"
+    slice_frame["rawseq_wf_split"] = "purge_embargo"
+    rel_train_start = 0
+    rel_train_end = window.train_end - window.train_start
     rel_validation_start = window.validation_start - window.train_start
+    rel_validation_end = window.validation_end - window.train_start
     rel_test_start = window.test_start - window.train_start
-    slice_frame.loc[slice_frame.index[rel_validation_start:rel_test_start], "rawseq_wf_split"] = "validation"
-    slice_frame.loc[slice_frame.index[rel_test_start:], "rawseq_wf_split"] = "test"
+    rel_test_end = window.test_end - window.train_start
+    slice_frame.loc[slice_frame.index[rel_train_start:rel_train_end], "rawseq_wf_split"] = "train"
+    slice_frame.loc[slice_frame.index[rel_validation_start:rel_validation_end], "rawseq_wf_split"] = "validation"
+    slice_frame.loc[slice_frame.index[rel_test_start:rel_test_end], "rawseq_wf_split"] = "test"
+    slice_frame["rawseq_wf_purge_rows"] = window.purge_rows
+    slice_frame["rawseq_wf_embargo_rows"] = window.embargo_rows
     path.parent.mkdir(parents=True, exist_ok=True)
     slice_frame.to_csv(path, index=False)
     return slice_frame
@@ -748,6 +832,7 @@ def best_test_row(evaluation_path: Path) -> tuple[dict[str, Any], list[dict[str,
     if frame.empty:
         return {}, []
     split_text = frame["split"].astype(str).str.lower() if "split" in frame.columns else pd.Series("", index=frame.index)
+    validation = frame[split_text.str.contains("validation", na=False)].copy()
     test = frame[split_text.str.contains("test", na=False)].copy()
     if test.empty:
         return {}, []
@@ -778,6 +863,8 @@ def best_test_row(evaluation_path: Path) -> tuple[dict[str, Any], list[dict[str,
     ]:
         if column in test.columns:
             test[column] = pd.to_numeric(test[column], errors="coerce")
+        if column in validation.columns:
+            validation[column] = pd.to_numeric(validation[column], errors="coerce")
     output_label = safe_str(test["output_label"].dropna().iloc[0]) if "output_label" in test.columns and test["output_label"].notna().any() else "future_return_path"
     if output_label and output_label != "future_return_path":
         metric_rows = test[test["strategy"].astype(str).eq("label_metric_summary")].copy() if "strategy" in test.columns else test.copy()
@@ -806,13 +893,61 @@ def best_test_row(evaluation_path: Path) -> tuple[dict[str, Any], list[dict[str,
             "model_beats_median_mae_baseline",
         ]:
             test.loc[metric_rows.index, column] = metric_rows[column]
+        if not validation.empty:
+            validation_metric_rows = (
+                validation[validation["strategy"].astype(str).eq("label_metric_summary")].copy()
+                if "strategy" in validation.columns
+                else validation.copy()
+            )
+            if not validation_metric_rows.empty:
+                validation_metric_rows["validation_label_rank_score"] = validation_metric_rows.apply(
+                    label_rank_score, axis=1
+                )
+                validation_idx = validation_metric_rows["validation_label_rank_score"].idxmax()
+                validation_row = validation_metric_rows.loc[validation_idx]
+                match = metric_rows.copy()
+                for key in ["strategy", "decision_horizon_seconds"]:
+                    if key in match.columns and key in validation_row.index and safe_str(validation_row.get(key)):
+                        match = match[match[key].astype(str).eq(safe_str(validation_row.get(key)))]
+                best = match.iloc[0].copy() if not match.empty else metric_rows.iloc[0].copy()
+                best["selection_stage"] = "validation_selected"
+                best["selection_strategy"] = safe_str(validation_row.get("strategy"))
+                best["validation_selection_label_rank_score"] = safe_float(
+                    validation_row.get("validation_label_rank_score")
+                )
+                records = test.to_dict(orient="records")
+                return best.to_dict(), records
         best_idx = metric_rows["guarded_label_rank_score"].idxmax()
+        test.loc[best_idx, "selection_stage"] = "test_selected"
+    elif not validation.empty:
+        if "cumulative_return_bps" in validation.columns and validation["cumulative_return_bps"].notna().any():
+            validation_idx = validation["cumulative_return_bps"].idxmax()
+        elif "avg_return_bps" in validation.columns and validation["avg_return_bps"].notna().any():
+            validation_idx = validation["avg_return_bps"].idxmax()
+        else:
+            validation_idx = validation.index[0]
+        validation_row = validation.loc[validation_idx]
+        match = test.copy()
+        for key in ["strategy", "threshold_bps", "decision_horizon_seconds"]:
+            if key in match.columns and key in validation_row.index and safe_str(validation_row.get(key)):
+                match = match[match[key].astype(str).eq(safe_str(validation_row.get(key)))]
+        best = match.iloc[0].copy() if not match.empty else test.iloc[0].copy()
+        best["selection_stage"] = "validation_selected"
+        best["selection_strategy"] = safe_str(validation_row.get("strategy"))
+        best["validation_selection_cumulative_return_bps"] = safe_float(validation_row.get("cumulative_return_bps"))
+        best["validation_selection_avg_return_bps"] = safe_float(validation_row.get("avg_return_bps"))
+        best["validation_selection_threshold_bps"] = safe_float(validation_row.get("threshold_bps"))
+        records = test.to_dict(orient="records")
+        return best.to_dict(), records
     elif "cumulative_return_bps" in test.columns and test["cumulative_return_bps"].notna().any():
         best_idx = test["cumulative_return_bps"].idxmax()
+        test.loc[best_idx, "selection_stage"] = "test_selected"
     elif "avg_return_bps" in test.columns and test["avg_return_bps"].notna().any():
         best_idx = test["avg_return_bps"].idxmax()
+        test.loc[best_idx, "selection_stage"] = "test_selected"
     else:
         best_idx = test.index[0]
+        test.loc[best_idx, "selection_stage"] = "test_selected"
     records = test.to_dict(orient="records")
     return test.loc[best_idx].to_dict(), records
 
@@ -941,6 +1076,14 @@ def candidate_row(
     actual_temp_paths = [p for p in actual_paths if p.name.startswith(".t_")]
     actual_longest_temp = max(actual_temp_paths, key=path_length) if actual_temp_paths else None
     projected = projected_path_metrics(archive_dir)
+    failure_class = status if status in {
+        "PATH_GUARD_FAILED",
+        "TRAIN_FAILED",
+        "DATA_FAILED",
+        "METADATA_WRITE_FAILED",
+        "ARCHIVE_FAILED",
+    } else ""
+    failure_message = safe_str(path_info.get("path_guard_reason")) if status == "PATH_GUARD_FAILED" else ""
     return {
         "run_id": run_id,
         "window_id": window.window_id,
@@ -954,10 +1097,16 @@ def candidate_row(
         "actual_longest_artifact_path": str(actual_longest),
         "actual_longest_temp_path_length": path_length(actual_longest_temp) if actual_longest_temp is not None else 0,
         "actual_longest_temp_path": str(actual_longest_temp) if actual_longest_temp is not None else "",
+        "attempted_path": safe_str(path_info.get("attempted_path") or projected.get("attempted_path")),
+        "attempted_path_length": safe_int(path_info.get("attempted_path_length") or projected.get("attempted_path_length")),
+        "max_allowed_path_length": safe_int(path_info.get("max_allowed_path_length") or projected.get("max_allowed_path_length")),
+        "path_guard_reason": safe_str(path_info.get("path_guard_reason") or projected.get("path_guard_reason")),
         "trainer_artifacts_path": str(trainer_dir) if trainer_dir.exists() else "",
         "trainer_artifacts_retained": trainer_dir.exists(),
         "trainer_artifacts_cleanup_status": "retained" if trainer_dir.exists() else "not_created_or_cleaned",
         "status": status,
+        "failure_class": failure_class,
+        "failure_message": failure_message,
         "exit_code": "" if completed is None else completed.returncode,
         "symbol": SYMBOL,
         "venue": PRIMARY_VENUE,
@@ -982,6 +1131,14 @@ def candidate_row(
         "train_rows_requested": TRAIN_ROWS,
         "validation_rows_requested": VALIDATION_ROWS,
         "test_rows_requested": TEST_ROWS,
+        "purge_rows": window.purge_rows,
+        "embargo_rows": window.embargo_rows,
+        "selection_stage": safe_str(best_row.get("selection_stage")) or "test_selected",
+        "selection_strategy": safe_str(best_row.get("selection_strategy") or best_row.get("strategy")),
+        "validation_selection_cumulative_return_bps": safe_float(best_row.get("validation_selection_cumulative_return_bps")),
+        "validation_selection_avg_return_bps": safe_float(best_row.get("validation_selection_avg_return_bps")),
+        "validation_selection_threshold_bps": safe_float(best_row.get("validation_selection_threshold_bps")),
+        "final_test_untouched": (safe_str(best_row.get("selection_stage")) == "validation_selected"),
         "archive_dir": str(archive_dir),
         "model_path": archived.get("model_path", ""),
         "archived_model_path": archived.get("archived_model_path", ""),
@@ -1042,6 +1199,7 @@ def window_row(window: WindowSpec, slice_frame: pd.DataFrame, source_slice_path:
     train = slice_frame[slice_frame["rawseq_wf_split"].eq("train")]
     validation = slice_frame[slice_frame["rawseq_wf_split"].eq("validation")]
     test = slice_frame[slice_frame["rawseq_wf_split"].eq("test")]
+    purge_embargo = slice_frame[slice_frame["rawseq_wf_split"].eq("purge_embargo")]
     start_time, end_time = timestamp_bounds(slice_frame)
     test_start, test_end = timestamp_bounds(test)
     return {
@@ -1054,6 +1212,15 @@ def window_row(window: WindowSpec, slice_frame: pd.DataFrame, source_slice_path:
         "train_rows": len(train),
         "validation_rows": len(validation),
         "test_rows": len(test),
+        "purge_rows": window.purge_rows,
+        "embargo_rows": window.embargo_rows,
+        "purge_embargo_rows": len(purge_embargo),
+        "effective_train_start_row": window.train_start,
+        "effective_train_end_row": window.train_end,
+        "effective_validation_start_row": window.validation_start,
+        "effective_validation_end_row": window.validation_end,
+        "effective_test_start_row": window.test_start,
+        "effective_test_end_row": window.test_end,
         "start_time": start_time,
         "end_time": end_time,
         "test_start_time": test_start,
@@ -1067,6 +1234,13 @@ def build_selected_by_window(candidates: pd.DataFrame) -> pd.DataFrame:
     valid = candidates[candidates["status"].eq("OK")].copy()
     if valid.empty:
         return pd.DataFrame()
+    if "selection_stage" in valid.columns:
+        eligible_stage = valid["selection_stage"].astype(str).str.lower().isin(
+            ["validation_selected", "holdout_evaluated", "forward_evaluated"]
+        )
+        valid = valid[eligible_stage].copy()
+        if valid.empty:
+            return pd.DataFrame()
     if "output_label" in valid.columns and valid["output_label"].astype(str).ne("future_return_path").any():
         guard = valid.get("baseline_guard_pass", pd.Series(False, index=valid.index)).astype(str).str.lower().isin(["true", "1", "yes", "y"])
         valid = valid[guard].copy()
@@ -1089,6 +1263,13 @@ def build_leaderboard(candidates: pd.DataFrame) -> pd.DataFrame:
     valid = candidates[candidates["status"].eq("OK")].copy()
     if valid.empty:
         return pd.DataFrame()
+    if "selection_stage" in valid.columns:
+        eligible_stage = valid["selection_stage"].astype(str).str.lower().isin(
+            ["validation_selected", "holdout_evaluated", "forward_evaluated"]
+        )
+        valid = valid[eligible_stage].copy()
+        if valid.empty:
+            return pd.DataFrame()
     for column in [
         "best_test_rows",
         "best_test_avg_return_bps",
@@ -1191,6 +1372,8 @@ def render_summary(
         f"Windows: {len(windows)}",
         f"Candidate runs: {len(candidates)}",
         f"Population/generations/epochs: {POPULATION}/{GENERATIONS}/{EPOCHS}",
+        f"Purge/embargo rows: {PURGE_ROWS}/{EMBARGO_ROWS}",
+        "Selection semantics: return-label strategies are validation-selected and test-evaluated; test-selected rows are not untouched final evidence.",
         "",
         "Leaderboard",
     ]
@@ -1274,12 +1457,55 @@ def main() -> None:
             path_info = archive_path_info(window_dir, contract)
             archive_dir = path_info["path"]
             path_info.update(projected_path_metrics(archive_dir))
+            if not path_info["windows_path_guard_pass"]:
+                contract_payload = payload_contract(None, contract)
+                contract_payload.update(
+                    {
+                        "window_id": window.window_id,
+                        "symbol": SYMBOL,
+                        "venue": PRIMARY_VENUE,
+                        "contract": full_contract_dict(contract),
+                        "contract_slug": contract_slug(contract),
+                        "full_contract_slug": path_info["full_contract_slug"],
+                        "filesystem_contract_slug": path_info["filesystem_contract_slug"],
+                        "filesystem_path_shortened": path_info["filesystem_path_shortened"],
+                        "projected_path_length": path_info["projected_path_length"],
+                        "source_slice_path": str(source_slice_path),
+                        "purge_rows": window.purge_rows,
+                        "embargo_rows": window.embargo_rows,
+                        "effective_train_start_row": window.train_start,
+                        "effective_train_end_row": window.train_end,
+                        "effective_validation_start_row": window.validation_start,
+                        "effective_validation_end_row": window.validation_end,
+                        "effective_test_start_row": window.test_start,
+                        "effective_test_end_row": window.test_end,
+                        "paper_only": True,
+                        "promotion": False,
+                        "champion_mutation": False,
+                        "orders": False,
+                    }
+                )
+                candidate_rows.append(
+                    candidate_row(
+                        run_id,
+                        window,
+                        contract,
+                        archive_dir,
+                        None,
+                        {},
+                        {},
+                        contract_payload,
+                        path_info,
+                        "PATH_GUARD_FAILED",
+                    )
+                )
+                continue
             safe_mkdir(archive_dir)
             completed = run_rawseq(window, contract, source_slice_path, archive_dir)
             archived = archive_outputs(archive_dir, completed)
             status_override = ""
             if completed is not None and completed.returncode != 0:
-                status_override = "TRAIN_FAILED"
+                status_override = trainer_failure_status(archive_dir, completed)
             if completed is None:
                 (archive_dir / "run.log").write_text("DRY_RUN: rawseq evolution not executed.\n", encoding="utf-8")
             evaluation_path = Path(archived.get("evaluation_path", "")) if archived.get("evaluation_path") else archive_dir / "evaluation.csv"
@@ -1298,6 +1524,14 @@ def main() -> None:
                     "filesystem_path_shortened": path_info["filesystem_path_shortened"],
                     "projected_path_length": path_info["projected_path_length"],
                     "source_slice_path": str(source_slice_path),
+                    "purge_rows": window.purge_rows,
+                    "embargo_rows": window.embargo_rows,
+                    "effective_train_start_row": window.train_start,
+                    "effective_train_end_row": window.train_end,
+                    "effective_validation_start_row": window.validation_start,
+                    "effective_validation_end_row": window.validation_end,
+                    "effective_test_start_row": window.test_start,
+                    "effective_test_end_row": window.test_end,
                     "paper_only": True,
                     "promotion": False,
                     "champion_mutation": False,
@@ -1316,6 +1550,14 @@ def main() -> None:
                         "projected_path_length": path_info["projected_path_length"],
                         **projected_path_metrics(archive_dir),
                         "archive_dir": str(archive_dir),
+                        "purge_rows": window.purge_rows,
+                        "embargo_rows": window.embargo_rows,
+                        "effective_train_start_row": window.train_start,
+                        "effective_train_end_row": window.train_end,
+                        "effective_validation_start_row": window.validation_start,
+                        "effective_validation_end_row": window.validation_end,
+                        "effective_test_start_row": window.test_start,
+                        "effective_test_end_row": window.test_end,
                         "paper_only": True,
                         "promotion": False,
                         "champion_mutation": False,

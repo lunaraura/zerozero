@@ -10,12 +10,18 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from rawseq_policy_scoring import score_policy_arrays
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROBE_ROOT = PROJECT_ROOT / "data" / "research" / "rawseq_candidate_shadow_probes"
@@ -128,21 +134,18 @@ def load_test_frame(path: Path) -> pd.DataFrame:
 def selected_gross(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     pred = pd.to_numeric(frame[PRED_COLUMN], errors="coerce")
     actual = pd.to_numeric(frame[ACTUAL_COLUMN], errors="coerce")
-    if POLICY == "inverse_gt":
-        mask = pred > THRESHOLD_BPS
-        gross = -actual
-    elif POLICY == "direct_gt":
-        mask = pred > THRESHOLD_BPS
-        gross = actual
-    elif POLICY == "inverse_directional_abs_gt":
-        mask = pred.abs() > THRESHOLD_BPS
-        gross = -np.sign(pred) * actual
-    else:
+    try:
+        scored = score_policy_arrays(pred.to_numpy(dtype="float64"), actual.to_numpy(dtype="float64"), POLICY, THRESHOLD_BPS)
+    except ValueError as exc:
         raise SystemExit(
             "RAWSEQ_DYNAMIC_POLICY must be one of: inverse_gt, direct_gt, inverse_directional_abs_gt"
-        )
-    mask = mask & np.isfinite(gross)
-    return mask, pd.Series(gross, index=frame.index, dtype="float64")
+        ) from exc
+    mask = pd.Series(scored["selected"], index=frame.index, dtype=bool)
+    result = pd.Series(scored["gross_bps"], index=frame.index, dtype="float64")
+    result.attrs["policy_direction_multiplier"] = pd.Series(
+        scored["policy_direction_multiplier"], index=frame.index, dtype="float64"
+    )
+    return mask, result
 
 
 def half_spread_bps(frame: pd.DataFrame, default_bps: float = 0.10) -> pd.Series:
@@ -221,10 +224,17 @@ def summarize_scenario(
     missing_columns: list[str],
 ) -> dict[str, Any]:
     selected_gross_values = gross[selected].to_numpy(dtype="float64")
+    direction = gross.attrs.get("policy_direction_multiplier")
+    selected_direction = (
+        direction[selected].to_numpy(dtype="float64")
+        if isinstance(direction, pd.Series)
+        else np.asarray([], dtype="float64")
+    )
     selected_costs = costs[selected].to_numpy(dtype="float64")
     finite = np.isfinite(selected_gross_values) & np.isfinite(selected_costs)
     selected_gross_values = selected_gross_values[finite]
     selected_costs = selected_costs[finite]
+    selected_direction = selected_direction[finite] if len(selected_direction) == len(finite) else selected_direction
     net = selected_gross_values - selected_costs
     rows = int(len(net))
     return {
@@ -239,10 +249,17 @@ def summarize_scenario(
         "input_stride": contract.get("input_stride", "1"),
         "output_stride": contract.get("output_stride", "1"),
         "policy": POLICY,
+        "policy_direction_multiplier": (
+            float(selected_direction[0])
+            if len(selected_direction) and np.all(selected_direction == selected_direction[0])
+            else math.nan
+        ),
+        "avg_policy_direction_multiplier": float(np.mean(selected_direction)) if len(selected_direction) else math.nan,
         "threshold_bps": THRESHOLD_BPS,
         "test_frac": TEST_FRAC,
         "selected_rows": rows,
         "avg_gross_bps": float(np.mean(selected_gross_values)) if rows else math.nan,
+        "cum_gross_bps": float(np.sum(selected_gross_values)) if rows else 0.0,
         "avg_dynamic_cost_bps": float(np.mean(selected_costs)) if rows else math.nan,
         "avg_net_bps": float(np.mean(net)) if rows else math.nan,
         "cum_net_bps": float(np.sum(net)) if rows else 0.0,

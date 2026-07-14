@@ -22,6 +22,15 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from rawseq_policy_scoring import (
+    policy_direction_multiplier as shared_policy_direction_multiplier,
+    score_policy_frame,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAWSEQ_SCRIPT = PROJECT_ROOT / "scripts" / "tiny_price_rawseq_path_v1.py"
@@ -47,6 +56,8 @@ PRED_COLUMN = "rawseq_path_pred_horizon_return_bps"
 ACTUAL_COLUMN = "rawseq_path_actual_horizon_return_bps"
 REQUIRED_ANNOTATED_COLUMNS = ["timestamp", "time", PRED_COLUMN, ACTUAL_COLUMN]
 ROLLING_WINDOW_HOURS = [1.0, 3.0, 6.0, 12.0, 24.0]
+BOOTSTRAP_SEED = 1729
+BOOTSTRAP_SAMPLES = 500
 
 
 def now_stamp() -> str:
@@ -129,6 +140,77 @@ def max_dip_bps(returns: np.ndarray) -> float:
     cumulative = np.cumsum(returns)
     peak = np.maximum.accumulate(cumulative)
     return float(np.min(cumulative - peak))
+
+
+def policy_direction_multiplier(policy: str, pred: np.ndarray) -> np.ndarray:
+    try:
+        return shared_policy_direction_multiplier(policy, pred)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def selected_policy_frame(frame: pd.DataFrame, threshold_bps: float) -> pd.DataFrame:
+    try:
+        return score_policy_frame(
+            frame,
+            PRED_COLUMN,
+            ACTUAL_COLUMN,
+            POLICY,
+            threshold_bps,
+            cost_bps=0.0,
+            selected_only=True,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def payoff_ratio(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype="float64")
+    values = values[np.isfinite(values)]
+    wins = values[values > 0.0]
+    losses = values[values < 0.0]
+    if len(wins) == 0 or len(losses) == 0:
+        return math.nan
+    return float(np.mean(wins) / abs(np.mean(losses)))
+
+
+def bootstrap_avg_ci(values: np.ndarray) -> tuple[float, float]:
+    values = np.asarray(values, dtype="float64")
+    values = values[np.isfinite(values)]
+    if len(values) < 2:
+        return math.nan, math.nan
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    means = np.empty(BOOTSTRAP_SAMPLES, dtype="float64")
+    for idx in range(BOOTSTRAP_SAMPLES):
+        sample = rng.choice(values, size=len(values), replace=True)
+        means[idx] = float(np.mean(sample))
+    return float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))
+
+
+def edge_source(win_rate: float, gross: np.ndarray) -> str:
+    ratio = payoff_ratio(gross)
+    if math.isfinite(win_rate) and win_rate >= 0.5:
+        return "win_rate"
+    if math.isfinite(ratio) and ratio > 1.0:
+        return "payoff_magnitude"
+    if math.isfinite(win_rate):
+        return "mixed_or_unclear"
+    return "insufficient_sample"
+
+
+def metric_row_from_returns(values: np.ndarray, prefix: str = "") -> dict[str, Any]:
+    values = np.asarray(values, dtype="float64")
+    values = values[np.isfinite(values)]
+    low, high = bootstrap_avg_ci(values)
+    return {
+        f"{prefix}rows": int(len(values)),
+        f"{prefix}avg_net_bps": float(np.mean(values)) if len(values) else math.nan,
+        f"{prefix}cum_net_bps": float(np.sum(values)) if len(values) else 0.0,
+        f"{prefix}win_rate_net": float(np.mean(values > 0.0)) if len(values) else math.nan,
+        f"{prefix}max_dip_net_bps": max_dip_bps(values),
+        f"{prefix}avg_net_ci95_low_bps": low,
+        f"{prefix}avg_net_ci95_high_bps": high,
+    }
 
 
 def safe_slug(text: str) -> str:
@@ -596,22 +678,8 @@ def load_test_frame(annotated_path: Path) -> pd.DataFrame:
 
 
 def selected_gross(frame: pd.DataFrame, threshold_bps: float) -> np.ndarray:
-    pred = frame[PRED_COLUMN].to_numpy(dtype="float64")
-    actual = frame[ACTUAL_COLUMN].to_numpy(dtype="float64")
-    if POLICY == "inverse_gt":
-        mask = pred > threshold_bps
-        gross = -actual[mask]
-    elif POLICY == "direct_gt":
-        mask = pred > threshold_bps
-        gross = actual[mask]
-    elif POLICY == "inverse_directional_abs_gt":
-        mask = np.abs(pred) > threshold_bps
-        gross = -np.sign(pred[mask]) * actual[mask]
-    else:
-        raise SystemExit(
-            "RAWSEQ_PROBE_POLICY must be one of: inverse_gt, direct_gt, inverse_directional_abs_gt"
-        )
-    gross = np.asarray(gross, dtype="float64")
+    selected = selected_policy_frame(frame, threshold_bps)
+    gross = selected["gross_bps"].to_numpy(dtype="float64") if "gross_bps" in selected.columns else np.asarray([])
     return gross[np.isfinite(gross)]
 
 
@@ -624,7 +692,9 @@ def build_cost_threshold_summary(
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for threshold in thresholds:
-        gross = selected_gross(test, threshold)
+        selected = selected_policy_frame(test, threshold)
+        gross = selected["gross_bps"].to_numpy(dtype="float64") if not selected.empty else np.asarray([])
+        direction = selected["policy_direction_multiplier"].to_numpy(dtype="float64") if not selected.empty else np.asarray([])
         for cost in costs:
             net = gross - cost
             rows.append(
@@ -643,8 +713,13 @@ def build_cost_threshold_summary(
                     "output_stride": contract["output_stride"],
                     "hidden": contract["hidden"],
                     "policy": POLICY,
+                    "row_metric_family": "row_signal_metrics",
                     "threshold_bps": threshold,
                     "cost_bps": cost,
+                    "policy_direction_multiplier": (
+                        float(direction[0]) if len(direction) and np.all(direction == direction[0]) else math.nan
+                    ),
+                    "avg_policy_direction_multiplier": float(np.mean(direction)) if len(direction) else math.nan,
                     "test_frac": TEST_FRAC,
                     "selected_rows": int(len(gross)),
                     "avg_gross_bps": float(np.mean(gross)) if len(gross) else math.nan,
@@ -662,6 +737,125 @@ def build_cost_threshold_summary(
                     "paper_only": True,
                     "orders": False,
                     "promotion": False,
+                    "champion_mutation": False,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_non_overlapping_summary(
+    test: pd.DataFrame,
+    contract: dict[str, Any],
+    thresholds: list[float],
+    costs: list[float],
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    horizon_ms = int_contract(contract, "decision_horizon_seconds", 30) * 1000
+    for threshold in thresholds:
+        selected = selected_policy_frame(test, threshold)
+        for cost in costs:
+            chosen = []
+            next_allowed = -math.inf
+            for _, row in selected.iterrows():
+                timestamp = finite_or_nan(row.get("timestamp"))
+                if not math.isfinite(timestamp) or timestamp < next_allowed:
+                    continue
+                net = finite_or_nan(row.get("gross_bps")) - cost
+                if math.isfinite(net):
+                    chosen.append(net)
+                    next_allowed = timestamp + horizon_ms
+            values = np.asarray(chosen, dtype="float64")
+            metric = metric_row_from_returns(values)
+            rows.append(
+                {
+                    "symbol": contract["symbol"],
+                    "venue": contract["venue"],
+                    "input_feature": contract["input_feature"],
+                    "hidden": contract["hidden"],
+                    "policy": POLICY,
+                    "metric_family": "non_overlapping_decision_metrics",
+                    "threshold_bps": threshold,
+                    "cost_bps": cost,
+                    "cooldown_ms": horizon_ms,
+                    "selected_rows_before_cooldown": int(len(selected)),
+                    "selected_rows": metric["rows"],
+                    "avg_net_bps": metric["avg_net_bps"],
+                    "cum_net_bps": metric["cum_net_bps"],
+                    "win_rate_net": metric["win_rate_net"],
+                    "max_dip_net_bps": metric["max_dip_net_bps"],
+                    "avg_net_ci95_low_bps": metric["avg_net_ci95_low_bps"],
+                    "avg_net_ci95_high_bps": metric["avg_net_ci95_high_bps"],
+                    "paper_only": True,
+                    "orders": False,
+                    "promotion": False,
+                    "champion_mutation": False,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_position_sim_summary(
+    test: pd.DataFrame,
+    contract: dict[str, Any],
+    thresholds: list[float],
+    costs: list[float],
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    horizon_ms = int_contract(contract, "decision_horizon_seconds", 30) * 1000
+    test_start = finite_or_nan(test["timestamp"].min())
+    test_end = finite_or_nan(test["timestamp"].max())
+    test_span_ms = max(test_end - test_start, 1.0) if math.isfinite(test_start) and math.isfinite(test_end) else math.nan
+    for threshold in thresholds:
+        selected = selected_policy_frame(test, threshold)
+        for cost in costs:
+            exits = []
+            holds = []
+            exposure_ms = 0.0
+            next_flat = -math.inf
+            turnover = 0
+            for _, row in selected.iterrows():
+                timestamp = finite_or_nan(row.get("timestamp"))
+                if not math.isfinite(timestamp) or timestamp < next_flat:
+                    continue
+                gross = finite_or_nan(row.get("gross_bps"))
+                if not math.isfinite(gross):
+                    continue
+                exits.append(gross - cost)
+                holds.append(horizon_ms)
+                exposure_ms += horizon_ms
+                turnover += 1
+                next_flat = timestamp + horizon_ms
+            values = np.asarray(exits, dtype="float64")
+            metric = metric_row_from_returns(values)
+            rows.append(
+                {
+                    "symbol": contract["symbol"],
+                    "venue": contract["venue"],
+                    "input_feature": contract["input_feature"],
+                    "hidden": contract["hidden"],
+                    "policy": POLICY,
+                    "metric_family": "position_sim_metrics",
+                    "threshold_bps": threshold,
+                    "cost_bps": cost,
+                    "position_cost_model": "round_trip_cost_bps_from_grid",
+                    "trade_count": metric["rows"],
+                    "selected_rows": metric["rows"],
+                    "avg_net_bps": metric["avg_net_bps"],
+                    "cum_net_bps": metric["cum_net_bps"],
+                    "win_rate_net": metric["win_rate_net"],
+                    "max_dip_net_bps": metric["max_dip_net_bps"],
+                    "avg_net_ci95_low_bps": metric["avg_net_ci95_low_bps"],
+                    "avg_net_ci95_high_bps": metric["avg_net_ci95_high_bps"],
+                    "avg_hold_ms": float(np.mean(holds)) if holds else math.nan,
+                    "turnover": turnover,
+                    "max_concurrent_positions": 1 if turnover else 0,
+                    "exposure_time_fraction": float(min(exposure_ms / test_span_ms, 1.0))
+                    if math.isfinite(test_span_ms)
+                    else math.nan,
+                    "paper_only": True,
+                    "orders": False,
+                    "promotion": False,
+                    "champion_mutation": False,
                 }
             )
     return pd.DataFrame(rows)
@@ -699,6 +893,7 @@ def build_rolling_summary(
                             "output_stride": contract["output_stride"],
                             "hidden": contract["hidden"],
                             "policy": POLICY,
+                            "row_metric_family": "row_signal_metrics",
                             "threshold_bps": threshold,
                             "cost_bps": cost,
                             "window_hours": window_hours,
@@ -713,6 +908,10 @@ def build_rolling_summary(
                             "cum_net_bps": float(np.sum(net)) if len(gross) else 0.0,
                             "win_rate_net": float(np.mean(net > 0.0)) if len(gross) else math.nan,
                             "max_dip_net_bps": max_dip_bps(net),
+                            "paper_only": True,
+                            "orders": False,
+                            "promotion": False,
+                            "champion_mutation": False,
                         }
                     )
     return pd.DataFrame(rows)
@@ -738,8 +937,11 @@ def build_label_policy_placeholder(contract: dict[str, Any], thresholds: list[fl
                     "output_stride": contract["output_stride"],
                     "hidden": contract["hidden"],
                     "policy": "label_specific_metrics_only",
+                    "row_metric_family": "not_applicable",
                     "threshold_bps": threshold,
                     "cost_bps": cost,
+                    "policy_direction_multiplier": math.nan,
+                    "avg_policy_direction_multiplier": math.nan,
                     "test_frac": TEST_FRAC,
                     "selected_rows": 0,
                     "avg_gross_bps": math.nan,
@@ -755,6 +957,7 @@ def build_label_policy_placeholder(contract: dict[str, Any], thresholds: list[fl
                     "paper_only": True,
                     "orders": False,
                     "promotion": False,
+                    "champion_mutation": False,
                 }
             )
     return pd.DataFrame(rows)
@@ -781,6 +984,8 @@ def render_text(
     audit: pd.DataFrame,
     cost_summary: pd.DataFrame,
     rolling: pd.DataFrame,
+    non_overlapping: pd.DataFrame,
+    position_sim: pd.DataFrame,
     run_dir: Path,
     artifacts: dict[str, Path],
 ) -> str:
@@ -832,6 +1037,7 @@ def render_text(
     lines += [
         "",
         "Fixed Cost/Threshold Summary",
+        "  metric_family: row_signal_metrics",
         f"  policy: {POLICY}",
         f"  thresholds: {THRESHOLD_BPS_LIST_ENV}",
         f"  costs: {COST_BPS_LIST_ENV}",
@@ -858,6 +1064,35 @@ def render_text(
             f"avg_net={finite_or_nan(best_row['avg_net_bps']):.6f} "
             f"cum_net={finite_or_nan(best_row['cum_net_bps']):.6f}"
         )
+
+    for title, frame in [
+        ("Non-Overlapping Decision Metrics", non_overlapping),
+        ("Position Simulation Metrics", position_sim),
+    ]:
+        lines += ["", title]
+        if frame.empty:
+            lines.append("  no rows")
+            continue
+        threshold = 0.3 if any(abs(t - 0.3) < 1e-12 for t in frame["threshold_bps"]) else float(frame["threshold_bps"].iloc[0])
+        cost = 0.1 if any(abs(c - 0.1) < 1e-12 for c in frame["cost_bps"]) else float(frame["cost_bps"].iloc[0])
+        subset = frame[
+            (frame["threshold_bps"].sub(threshold).abs() < 1e-12)
+            & (frame["cost_bps"].sub(cost).abs() < 1e-12)
+        ]
+        if subset.empty:
+            lines.append(f"  threshold={threshold:g} cost={cost:g}: not available")
+        else:
+            row = subset.iloc[0]
+            rows_label = "trade_count" if "trade_count" in row else "selected_rows"
+            lines.append(
+                f"  threshold={threshold:g} cost={cost:g}: "
+                f"{rows_label}={finite_or_nan(row.get(rows_label)):.0f} "
+                f"avg_net={finite_or_nan(row.get('avg_net_bps')):.6f} "
+                f"cum_net={finite_or_nan(row.get('cum_net_bps')):.6f} "
+                f"win_net={finite_or_nan(row.get('win_rate_net')):.6f} "
+                f"ci95=[{finite_or_nan(row.get('avg_net_ci95_low_bps')):.6f},"
+                f"{finite_or_nan(row.get('avg_net_ci95_high_bps')):.6f}]"
+            )
 
     lines += [
         "",
@@ -914,13 +1149,19 @@ def main() -> None:
         test = load_test_frame(artifacts["annotated"])
         cost_summary = build_cost_threshold_summary(test, contract, thresholds, costs, artifacts["annotated"])
         rolling = build_rolling_summary(test, contract, thresholds, costs)
+        non_overlapping = build_non_overlapping_summary(test, contract, thresholds, costs)
+        position_sim = build_position_sim_summary(test, contract, thresholds, costs)
     else:
         cost_summary = build_label_policy_placeholder(contract, thresholds, costs, artifacts["annotated"])
         rolling = pd.DataFrame()
+        non_overlapping = pd.DataFrame()
+        position_sim = pd.DataFrame()
     cost_summary.to_csv(run_dir / "cost_threshold_summary.csv", index=False)
     rolling.to_csv(run_dir / "rolling_summary.csv", index=False)
+    non_overlapping.to_csv(run_dir / "non_overlapping_decision_metrics.csv", index=False)
+    position_sim.to_csv(run_dir / "position_sim_metrics.csv", index=False)
 
-    text = render_text(contract, audit, cost_summary, rolling, run_dir, artifacts)
+    text = render_text(contract, audit, cost_summary, rolling, non_overlapping, position_sim, run_dir, artifacts)
     summary_path = run_dir / "summary.txt"
     summary_path.write_text(text, encoding="utf-8")
 

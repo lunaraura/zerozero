@@ -83,6 +83,9 @@ OUTPUT_COLUMNS = [
     "best_threshold_for_probe",
     "best_status_for_probe",
     "status_explanation",
+    "selection_stage",
+    "credible_status_allowed",
+    "evidence_class",
     "probe_dir",
     "threshold_bps",
     "decision_cost_bps",
@@ -421,6 +424,10 @@ def merge_threshold_maps(*maps: dict[str, dict[str, Any]]) -> dict[str, dict[str
     return merged
 
 
+def clean_status_allowed(row: dict[str, Any]) -> bool:
+    return safe_str(row.get("selection_stage")) in {"holdout_evaluated", "forward_evaluated"}
+
+
 def classify(row: dict[str, Any]) -> tuple[str, list[str]]:
     fixed_010 = safe_float(row.get("fixed_0_10_cum_net"), safe_float(row.get("cum_net_bps"), 0.0))
     half_plus = safe_float(row.get("half_spread_plus_0_05_cum_net"), math.nan)
@@ -452,6 +459,9 @@ def classify(row: dict[str, Any]) -> tuple[str, list[str]]:
         and rolling_12h >= 0.5
         and rolling_24h >= 0.5
     ):
+        if not clean_status_allowed(row):
+            reasons.append("test_or_validation_selected_rows_are_not_clean_eligible")
+            return "robust_research_candidate", reasons
         return "clean_shadow_candidate", reasons
     if half_plus > 0.0 and dip_ratio <= 2.0:
         return "robust_research_candidate", reasons
@@ -524,6 +534,8 @@ def build_rows() -> list[dict[str, Any]]:
         for threshold, data in sorted(threshold_rows.items(), key=lambda item: safe_float(item[0], 999.0)):
             row = {"probe_dir": str(probe_dir), "threshold_bps": threshold, **contract}
             row.update(data)
+            row["selection_stage"] = safe_str(row.get("selection_stage")) or "test_selected"
+            row["credible_status_allowed"] = clean_status_allowed(row)
             for field in CONTRACT_FIELDS:
                 if not safe_str(row.get(field)):
                     row[field] = contract.get(field, "")
@@ -536,6 +548,13 @@ def build_rows() -> list[dict[str, Any]]:
             row["status"] = status
             row["status_priority"] = STATUS_PRIORITY[status]
             row["rejection_reasons"] = ";".join(reasons)
+            row["evidence_class"] = (
+                "credible_shadow_candidate"
+                if status == "clean_shadow_candidate" and clean_status_allowed(row)
+                else "fragile_research_signal"
+                if status != "reject"
+                else "rejected_research_signal"
+            )
             row["conservative_missing_liquidity_penalty_positive"] = (
                 safe_float(row.get("conservative_missing_liquidity_penalty_cum_net"), math.nan) > 0.0
             )
@@ -727,6 +746,7 @@ def render_row(row: pd.Series) -> str:
     )
     return (
         f"  {row.get('status', '')} threshold={fmt(row.get('threshold_bps'), 3)} "
+        f"stage={row.get('selection_stage', '')} evidence={row.get('evidence_class', '')} "
         f"rows={int(safe_float(row.get('selected_rows'), 0))} fixed010={fmt(row.get('fixed_0_10_cum_net'))} "
         f"fixed025={fmt(row.get('fixed_0_25_cum_net'))} "
         f"half+005={fmt(row.get('half_spread_plus_0_05_cum_net'))} "
@@ -809,6 +829,8 @@ def render_text(frame: pd.DataFrame, output_dir: Path, top_frame: pd.DataFrame, 
         "",
         "6. Warning",
         "  Threshold-specific clean status is not a champion freeze.",
+        "  Rows with selection_stage=test_selected are fragile research signals, even when threshold metrics are strong.",
+        "  Clean shadow status is reserved for holdout_evaluated or forward_evaluated evidence.",
         "  Do not create or mutate champion folders from this report alone.",
         "  This is a paper-only shadow registry. Promotion requires a separate explicit freeze/audit step.",
         "",

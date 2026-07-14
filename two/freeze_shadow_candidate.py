@@ -36,6 +36,11 @@ def now_stamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
+def now_iso_and_ms() -> tuple[str, int]:
+    now = datetime.now(UTC)
+    return now.isoformat(), int(now.timestamp() * 1000)
+
+
 def resolve_project_path(value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else PROJECT_ROOT / path
@@ -217,17 +222,24 @@ def main() -> int:
     copied.append({"source": str(registry_dir / "top_shadow_candidates.csv"), "destination": str(registry_row_path), "bytes": str(registry_row_path.stat().st_size)})
 
     model_contract = load_json_if_exists(probe_dir / "model_contract.json")
+    frozen_at_iso, frozen_at_timestamp_ms = now_iso_and_ms()
     provenance = {
         "created_at": now_stamp(),
+        "frozen_at_iso": frozen_at_iso,
+        "frozen_at_timestamp_ms": frozen_at_timestamp_ms,
         "purpose": "read_only_research_shadow_candidate_freeze",
         "registry_dir": str(registry_dir),
         "registry_source": str(registry_dir / "top_shadow_candidates.csv"),
         "probe_threshold_key": safe_str(row.get("probe_threshold_key")),
         "threshold_bps": threshold,
+        "selected_policy": safe_str(row.get("policy") or row.get("selected_policy") or row.get("fitness_policy") or "inverse_gt"),
         "decision_cost_bps": safe_str(row.get("decision_cost_bps")),
         "status": safe_str(row.get("status")),
         "decision": safe_str(row.get("decision")),
         "status_explanation": safe_str(row.get("status_explanation")),
+        "selection_stage": safe_str(row.get("selection_stage")),
+        "evidence_class": safe_str(row.get("evidence_class")),
+        "credible_status_allowed": safe_str(row.get("credible_status_allowed")),
         "probe_dir": str(probe_dir),
         "model_path": str(model_path),
         "contract": {
@@ -258,6 +270,8 @@ def main() -> int:
     }
     safety = {
         "paper_only": True,
+        "frozen_at_iso": frozen_at_iso,
+        "frozen_at_timestamp_ms": frozen_at_timestamp_ms,
         "read_only_research_shadow_candidate": True,
         "training": False,
         "champion_mutation": False,

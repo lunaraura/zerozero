@@ -7,6 +7,7 @@ import csv
 import json
 import math
 import os
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,12 @@ SHADOW_ROOT = Path(
 OUTPUT_PATH_ENV = os.getenv("RAWSEQ_SHADOW_COMPARISON_OUTPUT_PATH", "").strip()
 MIN_SELECTED_ROWS = int(float(os.getenv("RAWSEQ_FORWARD_MIN_SELECTED_ROWS", "100")))
 COMPARISON_MODE = os.getenv("RAWSEQ_FORWARD_COMPARISON_MODE", "best_available").strip().lower()
+INCLUDE_REPLAY = os.getenv("RAWSEQ_FORWARD_INCLUDE_REPLAY_IN_COMPARISON", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+}
 STATUS_PRIORITY = {
     "tracking_ok": 0,
     "degraded": 1,
@@ -71,6 +78,39 @@ def read_first_csv_row(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         return next(reader, {})
+
+
+def truthy(value: Any) -> bool:
+    return safe_str(value).lower() in {"1", "true", "yes", "y", "on"}
+
+
+def forward_evidence_type(run_dir: Path, summary: dict[str, Any] | None = None, metadata: dict[str, Any] | None = None) -> str:
+    summary = summary or read_first_csv_row(run_dir / "forward_summary.csv")
+    metadata = metadata or load_json(run_dir / "forward_run_metadata.json")
+    if truthy(summary.get("replay")) or truthy(metadata.get("replay")) or safe_str(metadata.get("replay_mode")) == "replay_window":
+        return "replay"
+    if safe_str(summary.get("evidence_type")):
+        return safe_str(summary.get("evidence_type"))
+    if safe_str(metadata.get("evidence_type")):
+        return safe_str(metadata.get("evidence_type"))
+    if truthy(summary.get("run_is_incremental")) or truthy(metadata.get("run_is_incremental")):
+        if truthy(summary.get("forward_cutoff_enforced")) or truthy(metadata.get("forward_cutoff_enforced")):
+            return "true_forward"
+        return "backfill_risk"
+    return "legacy_unknown"
+
+
+def policy_sign_status(summary: dict[str, Any], metadata: dict[str, Any]) -> tuple[str, str, str]:
+    version = safe_str(
+        metadata.get("policy_sign_semantics_version")
+        or summary.get("policy_sign_semantics_version")
+    )
+    policy = safe_str(metadata.get("policy") or summary.get("policy")).lower()
+    if version == "gross_bps_policy_multiplier_v1":
+        return version, "true", ""
+    if policy == "inverse_gt":
+        return version, "false", "legacy_inverse_gt_forward_scoring_may_have_used_wrong_sign"
+    return version, "unknown", "legacy_run_missing_policy_sign_semantics_version"
 
 
 def latest_forward_run(shadow_dir: Path) -> Path | None:
@@ -151,6 +191,8 @@ def classify_forward(selected: int, cum_net: float, max_dip: float, registry_cum
 def aggregate_summary(run_dirs: list[Path], registry_cum: float) -> dict[str, Any]:
     frames = []
     for run_dir in run_dirs:
+        if not INCLUDE_REPLAY and forward_evidence_type(run_dir) != "true_forward":
+            continue
         path = run_dir / "forward_labeled_results.csv"
         if not path.exists():
             continue
@@ -226,12 +268,23 @@ def choose_forward_run(run_dirs: list[Path]) -> tuple[Path | None, dict[str, Any
     run_summaries = [(run_dir, read_first_csv_row(run_dir / "forward_summary.csv")) for run_dir in run_dirs]
     latest_run, latest_summary = run_summaries[0]
     latest_rows = selected_rows(latest_summary)
-    best_run, best_summary = max(run_summaries, key=lambda item: selected_rows(item[1]))
+    comparable = [
+        (run_dir, summary)
+        for run_dir, summary in run_summaries
+        if INCLUDE_REPLAY or forward_evidence_type(run_dir, summary) == "true_forward"
+    ]
+    if not comparable:
+        best_run, best_summary = max(run_summaries, key=lambda item: selected_rows(item[1]))
+        return best_run, best_summary, "no_true_forward_runs_available_diagnostic_only", latest_summary, selected_rows(best_summary), latest_rows
+
+    best_run, best_summary = max(comparable, key=lambda item: selected_rows(item[1]))
     best_rows = selected_rows(best_summary)
 
     if COMPARISON_MODE == "latest":
-        return latest_run, latest_summary, "latest_mode", latest_summary, best_rows, latest_rows
-    eligible = [(run_dir, summary) for run_dir, summary in run_summaries if selected_rows(summary) >= MIN_SELECTED_ROWS]
+        if INCLUDE_REPLAY or forward_evidence_type(latest_run, latest_summary) == "true_forward":
+            return latest_run, latest_summary, "latest_mode", latest_summary, best_rows, latest_rows
+        return best_run, best_summary, "latest_mode_excluded_replay_or_backfill_used_best_true_forward", latest_summary, best_rows, latest_rows
+    eligible = [(run_dir, summary) for run_dir, summary in comparable if selected_rows(summary) >= MIN_SELECTED_ROWS]
     if eligible:
         chosen_run, chosen_summary = eligible[0]
         return chosen_run, chosen_summary, f"latest_with_selected_rows_ge_{MIN_SELECTED_ROWS}", latest_summary, best_rows, latest_rows
@@ -270,6 +323,10 @@ def candidate_row(shadow_dir: Path) -> dict[str, Any]:
         summary = normalize_forward_summary(summary, registry_cum)
         latest_summary = normalize_forward_summary(latest_summary, registry_cum)
     metadata = load_json(run_dir / "forward_run_metadata.json") if run_dir else {}
+    selected_evidence_type = forward_evidence_type(run_dir, summary, metadata) if run_dir else "none"
+    latest_evidence_type = forward_evidence_type(latest_run, latest_summary) if latest_run else "none"
+    evidence_counts = Counter(forward_evidence_type(path) for path in run_dirs)
+    sign_version, sign_valid, sign_warning = policy_sign_status(summary, metadata)
     forward_status = safe_str(summary.get("forward_status")) or "missing_forward"
     model_contract = provenance.get("model_contract") if isinstance(provenance.get("model_contract"), dict) else {}
     model_path = safe_str(provenance.get("model_path") or model_contract.get("model_path"))
@@ -282,6 +339,19 @@ def candidate_row(shadow_dir: Path) -> dict[str, Any]:
         "latest_selected_rows": latest_rows,
         "latest_forward_run": str(latest_run or ""),
         "selected_forward_run": str(run_dir or ""),
+        "selected_forward_evidence_type": selected_evidence_type,
+        "latest_forward_evidence_type": latest_evidence_type,
+        "true_forward_run_count": evidence_counts.get("true_forward", 0),
+        "replay_run_count": evidence_counts.get("replay", 0),
+        "backfill_or_legacy_run_count": sum(
+            count
+            for key, count in evidence_counts.items()
+            if key not in {"true_forward", "replay"}
+        ),
+        "excluded_replay_from_ranking": str(not INCLUDE_REPLAY),
+        "policy_sign_semantics_version": sign_version,
+        "policy_sign_valid": sign_valid,
+        "policy_sign_warning": sign_warning,
         "dry_run": safe_str(metadata.get("dry_run")),
         "status_priority": STATUS_PRIORITY.get(forward_status, 9),
         "forward_status": forward_status,
@@ -373,6 +443,7 @@ def write_text(path: Path, rows: list[dict[str, Any]]) -> None:
         f"Shadow root: {SHADOW_ROOT}",
         f"Mode: {COMPARISON_MODE}",
         f"Minimum selected rows: {MIN_SELECTED_ROWS}",
+        f"Include replay/backfill in ranking: {INCLUDE_REPLAY}",
         f"Frozen candidates: {len(rows)}",
         f"Grouped candidates: {len(grouped_rows)}",
         f"Duplicate groups: {len(duplicate_groups)}",
@@ -391,11 +462,39 @@ def write_text(path: Path, rows: list[dict[str, Any]]) -> None:
             f"{row['forward_status']} prelim={row['forward_status_preliminary']} "
             f"rows={row['forward_selected_rows']} cum={row['forward_cum_net_bps']} "
             f"ratio={row['forward_vs_registry_cum_ratio']} "
+            f"evidence={row['selected_forward_evidence_type']} "
+            f"policy_sign_valid={row.get('policy_sign_valid', '')} "
             f"group_best={row['group_best_candidate']} dup_count={row['duplicate_shadow_count']} "
             f"reason={row['forward_run_selection_reason']} runs={row['forward_run_count']} "
+            f"true_forward_runs={row['true_forward_run_count']} replay_runs={row['replay_run_count']} "
+            f"backfill_or_legacy_runs={row['backfill_or_legacy_run_count']} "
             f"{row['input_feature']} ma={row['ma_window']} h={row['hidden']} seed={row['seed']} "
             f"selected_run={row['selected_forward_run']} latest_run={row['latest_forward_run']}"
         )
+    lines.append("")
+    lines.append("Replay/backfill separation:")
+    for row in rows:
+        if row.get("selected_forward_evidence_type") != "true_forward" or safe_float(row.get("replay_run_count"), 0.0) > 0:
+            lines.append(
+                "  "
+                f"{row['candidate']}: selected_evidence={row['selected_forward_evidence_type']} "
+                f"latest_evidence={row['latest_forward_evidence_type']} "
+                f"true_forward={row['true_forward_run_count']} replay={row['replay_run_count']} "
+                f"backfill_or_legacy={row['backfill_or_legacy_run_count']} "
+                f"reason={row['forward_run_selection_reason']}"
+            )
+    lines.append("")
+    lines.append("Policy sign warnings:")
+    invalid_sign_rows = [row for row in rows if safe_str(row.get("policy_sign_valid")).lower() == "false"]
+    if invalid_sign_rows:
+        for row in invalid_sign_rows:
+            lines.append(
+                "  "
+                f"{row['candidate']}: {row.get('policy_sign_warning', '')} "
+                f"selected_run={row.get('selected_forward_run', '')}"
+            )
+    else:
+        lines.append("  none")
     lines.append("")
     lines.append("Grouped candidates:")
     for row in grouped_rows:

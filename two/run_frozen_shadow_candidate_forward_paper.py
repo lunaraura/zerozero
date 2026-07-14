@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +19,15 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from rawseq_policy_scoring import (
+    policy_direction_multiplier as shared_policy_direction_multiplier,
+    selected_mask as shared_selected_mask,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -39,6 +49,13 @@ RUN_IS_INCREMENTAL = REPLAY_MODE == "incremental"
 PRED_COLUMN = "rawseq_path_pred_horizon_return_bps"
 ACTUAL_COLUMN = "rawseq_path_actual_horizon_return_bps"
 ROLLING_WINDOW_HOURS = [1.0, 3.0, 6.0, 12.0, 24.0]
+FROZEN_AT_TIMESTAMP_KEYS = [
+    "frozen_at_timestamp_ms",
+    "created_at_timestamp_ms",
+    "created_timestamp_ms",
+]
+BOOTSTRAP_SEED = 1729
+BOOTSTRAP_SAMPLES = 500
 
 
 def now_stamp() -> str:
@@ -47,6 +64,20 @@ def now_stamp() -> str:
 
 def timestamp_to_iso(ms: float) -> str:
     return datetime.fromtimestamp(ms / 1000.0, tz=UTC).isoformat()
+
+
+def iso_to_timestamp_ms(text: str) -> float:
+    text = safe_str(text)
+    if not text:
+        return math.nan
+    try:
+        normalized = text.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return float(parsed.timestamp() * 1000.0)
+    except Exception:
+        return math.nan
 
 
 def safe_str(value: Any) -> str:
@@ -209,12 +240,60 @@ def max_dip_bps(values: np.ndarray) -> float:
 
 
 def select_mask(pred: np.ndarray, policy: str, threshold: float) -> np.ndarray:
-    policy = policy.lower().strip()
-    if policy in {"inverse_gt", "direct_gt", "gt", "pred_gt"}:
-        return pred > threshold
-    if policy in {"inverse_lt", "direct_lt", "lt", "pred_lt"}:
-        return pred < -threshold
-    raise SystemExit(f"Unsupported RAWSEQ_FORWARD_POLICY={policy}")
+    try:
+        return shared_selected_mask(pred, policy, threshold)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def policy_direction_multiplier(policy: str, pred: float | np.ndarray) -> float | np.ndarray:
+    try:
+        direction = shared_policy_direction_multiplier(policy, np.asarray(pred, dtype=np.float64))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if np.ndim(direction) == 0:
+        return float(direction)
+    if np.asarray(direction).shape == ():
+        return float(direction)
+    if np.asarray(direction).size == 1 and np.asarray(pred).shape == ():
+        return float(np.asarray(direction).reshape(-1)[0])
+    return direction
+
+
+def score_policy_gross(actual: float, pred: float, policy: str) -> tuple[float, float]:
+    if not math.isfinite(actual):
+        return math.nan, math.nan
+    multiplier = policy_direction_multiplier(policy, pred)
+    try:
+        multiplier_float = float(multiplier)
+    except Exception:
+        multiplier_float = math.nan
+    if not math.isfinite(multiplier_float):
+        return math.nan, math.nan
+    return multiplier_float * actual, multiplier_float
+
+
+def extract_frozen_at_timestamp_ms(provenance: dict[str, Any], payload: dict[str, Any]) -> float:
+    candidates: list[Any] = []
+    candidates.extend(provenance.get(key) for key in FROZEN_AT_TIMESTAMP_KEYS)
+    candidates.extend(payload.get(key) for key in FROZEN_AT_TIMESTAMP_KEYS)
+    safety = provenance.get("safety_metadata") if isinstance(provenance.get("safety_metadata"), dict) else {}
+    candidates.extend(safety.get(key) for key in FROZEN_AT_TIMESTAMP_KEYS)
+    for value in candidates:
+        numeric = safe_float(value, math.nan)
+        if math.isfinite(numeric):
+            return numeric
+
+    for value in [
+        provenance.get("frozen_at_iso"),
+        provenance.get("created_at"),
+        payload.get("frozen_at_iso"),
+        payload.get("created_at"),
+    ]:
+        numeric = iso_to_timestamp_ms(safe_str(value))
+        if math.isfinite(numeric):
+            return numeric
+    return math.nan
 
 
 def previous_seen_timestamps(output_dir: Path) -> tuple[set[int], int]:
@@ -250,6 +329,7 @@ def build_forward_rows(
     policy: str,
     cost_bps: float,
     seen: set[int],
+    frozen_at_timestamp_ms: float,
 ) -> tuple[pd.DataFrame, int]:
     contract = provenance.get("contract") if isinstance(provenance.get("contract"), dict) else {}
     seq_len = safe_int(payload.get("seq_len") or contract.get("seq_len"), 60)
@@ -277,8 +357,12 @@ def build_forward_rows(
 
     rows: list[dict[str, Any]] = []
     skipped_prior_rows = 0
+    skipped_pre_freeze_rows = 0
     for i in range(start_i, len(bucketed)):
         timestamp = int(timestamps[i])
+        if RUN_IS_INCREMENTAL and math.isfinite(frozen_at_timestamp_ms) and timestamp <= frozen_at_timestamp_ms:
+            skipped_pre_freeze_rows += 1
+            continue
         if timestamp in seen:
             skipped_prior_rows += 1
             continue
@@ -296,7 +380,8 @@ def build_forward_rows(
         label_available = i + horizon_offset < len(bucketed)
         if label_available:
             actual = float(sign * 10_000.0 * math.log(prices[i + horizon_offset] / prices[i]))
-        net = actual - cost_bps if selected and math.isfinite(actual) else math.nan
+        gross, direction_multiplier = score_policy_gross(actual, pred, policy) if selected else (math.nan, math.nan)
+        net = gross - cost_bps if selected and math.isfinite(gross) else math.nan
         rows.append(
             {
                 "timestamp": timestamp,
@@ -310,15 +395,21 @@ def build_forward_rows(
                 "selected": selected,
                 "label_available": label_available,
                 ACTUAL_COLUMN: actual,
+                "policy_direction_multiplier": direction_multiplier,
+                "gross_bps": gross,
                 "cost_bps": cost_bps,
                 "net_bps": net,
+                "evidence_type": "true_forward" if RUN_IS_INCREMENTAL else "replay",
+                "replay": not RUN_IS_INCREMENTAL,
                 "paper_only": True,
                 "orders": False,
                 "promotion": False,
                 "champion_mutation": False,
             }
         )
-    return pd.DataFrame(rows), skipped_prior_rows
+    result = pd.DataFrame(rows)
+    result.attrs["skipped_pre_freeze_rows"] = skipped_pre_freeze_rows
+    return result, skipped_prior_rows
 
 
 def rolling_summary(labeled_selected: pd.DataFrame) -> list[dict[str, Any]]:
@@ -356,7 +447,9 @@ def summary_rows(decisions: pd.DataFrame, provenance: dict[str, Any]) -> dict[st
     labeled = decisions[decisions["label_available"].astype(bool)].copy() if not decisions.empty else decisions
     selected = labeled[labeled["selected"].astype(bool)].copy() if not labeled.empty else labeled
     net = pd.to_numeric(selected["net_bps"], errors="coerce").dropna().to_numpy(dtype=np.float64) if not selected.empty else np.asarray([])
-    gross = pd.to_numeric(selected[ACTUAL_COLUMN], errors="coerce").dropna().to_numpy(dtype=np.float64) if not selected.empty else np.asarray([])
+    gross = pd.to_numeric(selected.get("gross_bps", pd.Series(dtype=float)), errors="coerce").dropna().to_numpy(dtype=np.float64) if not selected.empty else np.asarray([])
+    actual = pd.to_numeric(labeled.get(ACTUAL_COLUMN, pd.Series(dtype=float)), errors="coerce") if not labeled.empty else pd.Series(dtype=float)
+    pred = pd.to_numeric(labeled.get(PRED_COLUMN, pd.Series(dtype=float)), errors="coerce") if not labeled.empty else pd.Series(dtype=float)
     registry = provenance.get("metrics") if isinstance(provenance.get("metrics"), dict) else {}
     selected_rows = int(len(selected))
     avg_net = float(np.mean(net)) if len(net) else math.nan
@@ -393,10 +486,15 @@ def summary_rows(decisions: pd.DataFrame, provenance: dict[str, Any]) -> dict[st
         "labeled_rows": int(len(labeled)),
         "selected_rows": selected_rows,
         "avg_gross_bps": float(np.mean(gross)) if len(gross) else math.nan,
+        "cum_gross_bps": float(np.sum(gross)) if len(gross) else math.nan,
         "avg_net_bps": avg_net,
         "cumulative_net_bps": cum_net,
         "win_rate_net": win_rate,
         "max_dip_bps": max_dip,
+        "directional_accuracy_all_rows": directional_accuracy(pred, actual),
+        "signal_precision_net": win_rate,
+        "payoff_ratio_gross": payoff_ratio(gross),
+        "edge_source": edge_source(win_rate, gross),
         "registry_selected_rows": safe_str(registry.get("selected_rows")),
         "registry_fixed_0_10_cum_net": safe_str(registry.get("fixed_0_10_cum_net")),
         "registry_fixed_0_25_cum_net": safe_str(registry.get("fixed_0_25_cum_net")),
@@ -416,7 +514,143 @@ def summary_rows(decisions: pd.DataFrame, provenance: dict[str, Any]) -> dict[st
     }
 
 
-def write_summary_text(path: Path, summary: dict[str, Any], rolling: list[dict[str, Any]], shadow_dir: Path, source_path: Path, dry_run: bool) -> None:
+def directional_accuracy(pred: pd.Series, actual: pd.Series) -> float:
+    frame = pd.DataFrame({"pred": pred, "actual": actual}).replace([np.inf, -np.inf], np.nan).dropna()
+    frame = frame[(frame["pred"] != 0.0) & (frame["actual"] != 0.0)]
+    if frame.empty:
+        return math.nan
+    return float((np.sign(frame["pred"]) == np.sign(frame["actual"])).mean())
+
+
+def payoff_ratio(gross: np.ndarray) -> float:
+    values = np.asarray(gross, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    wins = values[values > 0.0]
+    losses = values[values < 0.0]
+    if len(wins) == 0 or len(losses) == 0:
+        return math.nan
+    return float(np.mean(wins) / abs(np.mean(losses)))
+
+
+def edge_source(win_rate: float, gross: np.ndarray) -> str:
+    ratio = payoff_ratio(gross)
+    if math.isfinite(win_rate) and win_rate >= 0.5:
+        return "win_rate"
+    if math.isfinite(ratio) and ratio > 1.0:
+        return "payoff_magnitude"
+    if math.isfinite(win_rate):
+        return "mixed_or_unclear"
+    return "insufficient_sample"
+
+
+def bootstrap_avg_ci(values: np.ndarray) -> tuple[float, float]:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if len(values) < 2:
+        return math.nan, math.nan
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    means = np.empty(BOOTSTRAP_SAMPLES, dtype=np.float64)
+    for idx in range(BOOTSTRAP_SAMPLES):
+        sample = rng.choice(values, size=len(values), replace=True)
+        means[idx] = float(np.mean(sample))
+    return float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))
+
+
+def return_metrics(values: np.ndarray) -> dict[str, Any]:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    low, high = bootstrap_avg_ci(values)
+    return {
+        "rows": int(len(values)),
+        "avg_net_bps": float(np.mean(values)) if len(values) else math.nan,
+        "cum_net_bps": float(np.sum(values)) if len(values) else math.nan,
+        "win_rate_net": float(np.mean(values > 0.0)) if len(values) else math.nan,
+        "max_dip_net_bps": max_dip_bps(values),
+        "avg_net_ci95_low_bps": low,
+        "avg_net_ci95_high_bps": high,
+    }
+
+
+def non_overlapping_metrics(labeled_selected: pd.DataFrame, horizon_ms: int) -> pd.DataFrame:
+    chosen = []
+    next_allowed = -math.inf
+    data = labeled_selected.sort_values("timestamp").copy()
+    for _, row in data.iterrows():
+        timestamp = safe_float(row.get("timestamp"))
+        if not math.isfinite(timestamp) or timestamp < next_allowed:
+            continue
+        net = safe_float(row.get("net_bps"))
+        if math.isfinite(net):
+            chosen.append(net)
+            next_allowed = timestamp + horizon_ms
+    metric = return_metrics(np.asarray(chosen, dtype=np.float64))
+    return pd.DataFrame(
+        [
+            {
+                "metric_family": "non_overlapping_decision_metrics",
+                "cooldown_ms": horizon_ms,
+                "selected_rows_before_cooldown": int(len(data)),
+                "selected_rows": metric["rows"],
+                **{key: value for key, value in metric.items() if key != "rows"},
+                "paper_only": True,
+                "orders": False,
+                "promotion": False,
+                "champion_mutation": False,
+            }
+        ]
+    )
+
+
+def position_sim_metrics(labeled_selected: pd.DataFrame, horizon_ms: int) -> pd.DataFrame:
+    exits = []
+    holds = []
+    exposure_ms = 0.0
+    next_flat = -math.inf
+    data = labeled_selected.sort_values("timestamp").copy()
+    span_ms = safe_float(data["timestamp"].max()) - safe_float(data["timestamp"].min()) if not data.empty else math.nan
+    span_ms = max(span_ms, 1.0) if math.isfinite(span_ms) else math.nan
+    for _, row in data.iterrows():
+        timestamp = safe_float(row.get("timestamp"))
+        if not math.isfinite(timestamp) or timestamp < next_flat:
+            continue
+        net = safe_float(row.get("net_bps"))
+        if math.isfinite(net):
+            exits.append(net)
+            holds.append(horizon_ms)
+            exposure_ms += horizon_ms
+            next_flat = timestamp + horizon_ms
+    metric = return_metrics(np.asarray(exits, dtype=np.float64))
+    return pd.DataFrame(
+        [
+            {
+                "metric_family": "position_sim_metrics",
+                "position_cost_model": "round_trip_cost_bps_from_forward_cost",
+                "trade_count": metric["rows"],
+                "selected_rows": metric["rows"],
+                **{key: value for key, value in metric.items() if key != "rows"},
+                "avg_hold_ms": float(np.mean(holds)) if holds else math.nan,
+                "turnover": int(len(exits)),
+                "max_concurrent_positions": 1 if exits else 0,
+                "exposure_time_fraction": float(min(exposure_ms / span_ms, 1.0)) if math.isfinite(span_ms) else math.nan,
+                "paper_only": True,
+                "orders": False,
+                "promotion": False,
+                "champion_mutation": False,
+            }
+        ]
+    )
+
+
+def write_summary_text(
+    path: Path,
+    summary: dict[str, Any],
+    rolling: list[dict[str, Any]],
+    non_overlap: pd.DataFrame,
+    position_sim: pd.DataFrame,
+    shadow_dir: Path,
+    source_path: Path,
+    dry_run: bool,
+) -> None:
     lines = [
         "Frozen Rawseq Shadow Candidate Forward Paper Run",
         "",
@@ -446,6 +680,24 @@ def write_summary_text(path: Path, summary: dict[str, Any], rolling: list[dict[s
             f"positive_fraction={row['positive_fraction']} "
             f"worst_window_bps={row['worst_window_bps']}"
         )
+    lines.append("")
+    lines.append("Non-overlapping decision metrics:")
+    for _, row in non_overlap.iterrows():
+        lines.append(
+            "  "
+            f"rows={row.get('selected_rows')} avg_net={row.get('avg_net_bps')} "
+            f"cum_net={row.get('cum_net_bps')} win={row.get('win_rate_net')} "
+            f"ci95=[{row.get('avg_net_ci95_low_bps')},{row.get('avg_net_ci95_high_bps')}]"
+        )
+    lines.append("")
+    lines.append("Position simulation metrics:")
+    for _, row in position_sim.iterrows():
+        lines.append(
+            "  "
+            f"trades={row.get('trade_count')} avg_net={row.get('avg_net_bps')} "
+            f"cum_net={row.get('cum_net_bps')} exposure={row.get('exposure_time_fraction')} "
+            f"turnover={row.get('turnover')}"
+        )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -460,8 +712,8 @@ def main() -> int:
 
     threshold = safe_float(provenance.get("threshold_bps") or payload.get("decision_threshold_bps"), 0.0)
     policy = POLICY_ENV or safe_str(provenance.get("selected_policy") or provenance.get("policy") or payload.get("fitness_policy") or "inverse_gt").lower()
-    if policy == "direct_gt":
-        policy = "inverse_gt"
+    frozen_at_timestamp_ms = extract_frozen_at_timestamp_ms(provenance, payload)
+    frozen_at_iso = timestamp_to_iso(frozen_at_timestamp_ms) if math.isfinite(frozen_at_timestamp_ms) else ""
 
     prior_seen, prior_real_runs_seen = previous_seen_timestamps(output_root)
     seen = prior_seen if RUN_IS_INCREMENTAL else set()
@@ -469,7 +721,17 @@ def main() -> int:
     contract = provenance.get("contract") if isinstance(provenance.get("contract"), dict) else {}
     bucket_seconds = safe_int(payload.get("bucket_seconds") or contract.get("bucket_seconds"), 10)
     bucketed = bucket_flow(frame, bucket_seconds)
-    decisions, skipped_prior_rows = build_forward_rows(bucketed, payload, provenance, threshold, policy, COST_BPS, seen)
+    decisions, skipped_prior_rows = build_forward_rows(
+        bucketed,
+        payload,
+        provenance,
+        threshold,
+        policy,
+        COST_BPS,
+        seen,
+        frozen_at_timestamp_ms,
+    )
+    skipped_pre_freeze_rows = int(decisions.attrs.get("skipped_pre_freeze_rows", 0))
 
     if DRY_RUN and len(decisions) > 5000:
         decisions = decisions.tail(5000).copy()
@@ -477,21 +739,53 @@ def main() -> int:
     labeled = decisions[decisions["label_available"].astype(bool)].copy() if not decisions.empty else decisions.copy()
     selected_labeled = labeled[labeled["selected"].astype(bool)].copy() if not labeled.empty else labeled.copy()
     selected_labeled["equity_bps"] = pd.to_numeric(selected_labeled.get("net_bps", pd.Series(dtype=float)), errors="coerce").fillna(0.0).cumsum()
+    horizon_seconds = safe_int(payload.get("decision_horizon_seconds"), 30)
+    horizon_ms = horizon_seconds * 1000
 
     summary = summary_rows(decisions, provenance)
     summary["replay_mode"] = REPLAY_MODE
     summary["replay"] = REPLAY_MODE == "replay_window"
     summary["skipped_prior_rows"] = skipped_prior_rows
+    summary["skipped_pre_freeze_rows"] = skipped_pre_freeze_rows
     summary["prior_real_forward_runs_seen"] = prior_real_runs_seen
     summary["run_is_incremental"] = RUN_IS_INCREMENTAL
+    summary["evidence_type"] = "true_forward" if RUN_IS_INCREMENTAL else "replay"
+    summary["frozen_at_timestamp_ms"] = frozen_at_timestamp_ms
+    summary["frozen_at_iso"] = frozen_at_iso
+    summary["forward_cutoff_enforced"] = RUN_IS_INCREMENTAL and math.isfinite(frozen_at_timestamp_ms)
+    summary["policy_sign_semantics_version"] = "gross_bps_policy_multiplier_v1"
     rolling = rolling_summary(selected_labeled)
+    non_overlap = non_overlapping_metrics(selected_labeled, horizon_ms)
+    position_sim = position_sim_metrics(selected_labeled, horizon_ms)
+    if not non_overlap.empty:
+        row = non_overlap.iloc[0]
+        summary["non_overlapping_selected_rows"] = row.get("selected_rows")
+        summary["non_overlapping_cum_net_bps"] = row.get("cum_net_bps")
+        summary["non_overlapping_avg_net_bps"] = row.get("avg_net_bps")
+        summary["non_overlapping_win_rate_net"] = row.get("win_rate_net")
+        summary["non_overlapping_avg_net_ci95_low_bps"] = row.get("avg_net_ci95_low_bps")
+        summary["non_overlapping_avg_net_ci95_high_bps"] = row.get("avg_net_ci95_high_bps")
+    if not position_sim.empty:
+        row = position_sim.iloc[0]
+        summary["position_trade_count"] = row.get("trade_count")
+        summary["position_cum_net_bps"] = row.get("cum_net_bps")
+        summary["position_avg_net_bps"] = row.get("avg_net_bps")
+        summary["position_win_rate_net"] = row.get("win_rate_net")
+        summary["position_exposure_time_fraction"] = row.get("exposure_time_fraction")
 
     decisions.to_csv(run_dir / "forward_decisions.csv", index=False)
     labeled.to_csv(run_dir / "forward_labeled_results.csv", index=False)
-    selected_labeled[["timestamp", "time", "net_bps", "equity_bps"]].to_csv(run_dir / "forward_equity_curve.csv", index=False)
+    equity_columns = [
+        column
+        for column in ["timestamp", "time", "gross_bps", "cost_bps", "net_bps", "policy_direction_multiplier", "equity_bps"]
+        if column in selected_labeled.columns
+    ]
+    selected_labeled[equity_columns].to_csv(run_dir / "forward_equity_curve.csv", index=False)
     pd.DataFrame([summary]).to_csv(run_dir / "forward_summary.csv", index=False)
     pd.DataFrame(rolling).to_csv(run_dir / "forward_rolling_summary.csv", index=False)
-    write_summary_text(run_dir / "forward_summary.txt", summary, rolling, shadow_dir, source_path, DRY_RUN)
+    non_overlap.to_csv(run_dir / "forward_non_overlapping_decision_metrics.csv", index=False)
+    position_sim.to_csv(run_dir / "forward_position_sim_metrics.csv", index=False)
+    write_summary_text(run_dir / "forward_summary.txt", summary, rolling, non_overlap, position_sim, shadow_dir, source_path, DRY_RUN)
     (run_dir / "forward_run_metadata.json").write_text(
         json.dumps(
             {
@@ -501,7 +795,12 @@ def main() -> int:
                 "replay_mode": REPLAY_MODE,
                 "run_is_incremental": RUN_IS_INCREMENTAL,
                 "skipped_prior_rows": skipped_prior_rows,
+                "skipped_pre_freeze_rows": skipped_pre_freeze_rows,
                 "prior_real_forward_runs_seen": prior_real_runs_seen,
+                "frozen_at_timestamp_ms": frozen_at_timestamp_ms,
+                "frozen_at_iso": frozen_at_iso,
+                "forward_cutoff_enforced": RUN_IS_INCREMENTAL and math.isfinite(frozen_at_timestamp_ms),
+                "evidence_type": "true_forward" if RUN_IS_INCREMENTAL else "replay",
                 "paper_only": True,
                 "orders": False,
                 "promotion": False,
@@ -511,6 +810,7 @@ def main() -> int:
                 "policy": policy,
                 "threshold_bps": threshold,
                 "cost_bps": COST_BPS,
+                "policy_sign_semantics_version": "gross_bps_policy_multiplier_v1",
             },
             indent=2,
             sort_keys=True,
@@ -528,8 +828,10 @@ def main() -> int:
     print(f"Cost bps: {COST_BPS:g}")
     print(f"Replay mode: {REPLAY_MODE}")
     print(f"Run is incremental: {RUN_IS_INCREMENTAL}")
+    print(f"Frozen at timestamp ms: {frozen_at_timestamp_ms}")
     print(f"Prior real forward runs seen: {prior_real_runs_seen}")
     print(f"Skipped prior rows: {skipped_prior_rows}")
+    print(f"Skipped pre-freeze rows: {skipped_pre_freeze_rows}")
     print(f"Decision rows: {summary['decision_rows']}")
     print(f"Labeled rows: {summary['labeled_rows']}")
     print(f"Selected rows: {summary['selected_rows']}")

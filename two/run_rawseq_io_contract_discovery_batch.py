@@ -92,6 +92,7 @@ FATAL_FAILURES = {
 }
 IS_WINDOWS = os.name == "nt"
 WINDOWS_SAFE_PATH_LIMIT = 220
+WINDOWS_MAX_PATH_LENGTH = int(float(os.getenv("RAWSEQ_IO_DISCOVERY_MAX_PATH_LENGTH", "240")))
 MAX_PATH_COMPONENT_LEN = 64
 OUTPUT_LABEL_TOKENS = {
     "future_return_path": "frp",
@@ -248,6 +249,12 @@ def contract_path_info(
     temp_paths = [path.parent / ".t_12345678" for path in final_paths if path.suffix in {".json", ".csv"}]
     longest_artifact = max(final_paths, key=path_length)
     longest_temp = max(temp_paths, key=path_length)
+    longest_temp_length = path_length(longest_temp)
+    guard_pass = (not IS_WINDOWS) or longest_temp_length < WINDOWS_MAX_PATH_LENGTH
+    guard_reason = "" if guard_pass else (
+        f"projected_longest_temp_path_length={longest_temp_length} "
+        f">= max_allowed_path_length={WINDOWS_MAX_PATH_LENGTH}"
+    )
     return {
         "contract_dir": contract_dir,
         "full_contract_slug": full_slug,
@@ -260,7 +267,11 @@ def contract_path_info(
         "projected_longest_temp_path_length": path_length(longest_temp),
         "projected_longest_artifact_path": str(longest_artifact),
         "projected_longest_temp_path": str(longest_temp),
-        "windows_path_guard_pass": (not IS_WINDOWS) or path_length(longest_temp) < 240,
+        "windows_path_guard_pass": guard_pass,
+        "attempted_path": str(longest_temp),
+        "attempted_path_length": longest_temp_length,
+        "max_allowed_path_length": WINDOWS_MAX_PATH_LENGTH,
+        "path_guard_reason": guard_reason,
         "offending_component_length": offending_component_length(contract_dir),
     }
 
@@ -306,6 +317,20 @@ def output_root() -> Path:
     return path
 
 
+def failure_status_from_output(output: str) -> str:
+    lower = output.lower()
+    if "path_guard_failed" in lower or "windows path guard" in lower:
+        return "PATH_GUARD_FAILED"
+    if (
+        "rawseq_wf_source_path does not exist" in lower
+        or "rawseq_wf_source_path has no rows" in lower
+        or "no walk-forward windows available" in lower
+        or "no rawseq rows built" in lower
+    ):
+        return "DATA_FAILED"
+    return "TRAIN_FAILED"
+
+
 def short_contract_dir_name(row: dict[str, str], index: int) -> str:
     return filesystem_contract_slug(row, index)
 
@@ -332,13 +357,37 @@ def run_contract(
         "projected_candidate_dir_length": path_info["projected_candidate_dir_length"],
         "projected_longest_artifact_path_length": path_info["projected_longest_artifact_path_length"],
         "projected_longest_temp_path_length": path_info["projected_longest_temp_path_length"],
+        "projected_longest_artifact_path": path_info["projected_longest_artifact_path"],
+        "projected_longest_temp_path": path_info["projected_longest_temp_path"],
         "windows_path_guard_pass": path_info["windows_path_guard_pass"],
+        "attempted_path": path_info["attempted_path"],
+        "attempted_path_length": path_info["attempted_path_length"],
+        "max_allowed_path_length": path_info["max_allowed_path_length"],
+        "path_guard_reason": path_info["path_guard_reason"],
+        "offending_component_length": path_info["offending_component_length"],
         "attempt_index": attempt_index,
         "attempt_seed": seed_override or parse_seed_limit(SEEDS),
         "requested_population": POPULATION,
         "requested_generations": GENERATIONS,
         "requested_epochs": EPOCHS,
     }
+    if not path_info["windows_path_guard_pass"]:
+        elapsed = time.monotonic() - started_at
+        if path_length(contract_dir) < WINDOWS_SAFE_PATH_LIMIT:
+            safe_mkdir(contract_dir)
+            (contract_dir / "path_guard_failed.json").write_text(
+                json.dumps(contract_record, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        return base_summary(
+            contract_record,
+            contract_dir,
+            "PATH_GUARD_FAILED",
+            "path_guard",
+            elapsed,
+            0.0,
+            "",
+        )
     safe_mkdir(contract_dir)
     (contract_dir / "contract.json").write_text(json.dumps(contract_record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -425,7 +474,13 @@ def run_contract(
         )
         log_path.write_text(completed.stdout or "", encoding="utf-8")
         runtime = time.monotonic() - run_started
-        status = "DRY_RUN" if DRY_RUN and completed.returncode == 0 else "OK" if completed.returncode == 0 else "TRAIN_FAILED"
+        status = (
+            "DRY_RUN"
+            if DRY_RUN and completed.returncode == 0
+            else "OK"
+            if completed.returncode == 0
+            else failure_status_from_output(completed.stdout or "")
+        )
         return summarize_contract(contract_record, contract_dir, wf_output_root / wf_run_id, status, completed.returncode, runtime, str(log_path))
     except subprocess.TimeoutExpired as exc:
         log_path.write_text((exc.stdout or "") if isinstance(exc.stdout, str) else "", encoding="utf-8")
@@ -451,9 +506,16 @@ def base_summary(
         "projected_candidate_dir_length": safe_str(row.get("projected_candidate_dir_length")),
         "projected_longest_artifact_path_length": safe_str(row.get("projected_longest_artifact_path_length")),
         "projected_longest_temp_path_length": safe_str(row.get("projected_longest_temp_path_length")),
+        "projected_longest_artifact_path": safe_str(row.get("projected_longest_artifact_path")),
+        "projected_longest_temp_path": safe_str(row.get("projected_longest_temp_path")),
         "actual_longest_artifact_path_length": safe_str(row.get("actual_longest_artifact_path_length")),
         "actual_longest_temp_path_length": safe_str(row.get("actual_longest_temp_path_length")),
         "windows_path_guard_pass": safe_str(row.get("windows_path_guard_pass")),
+        "attempted_path": safe_str(row.get("attempted_path")),
+        "attempted_path_length": safe_str(row.get("attempted_path_length")),
+        "max_allowed_path_length": safe_str(row.get("max_allowed_path_length")),
+        "path_guard_reason": safe_str(row.get("path_guard_reason")),
+        "offending_component_length": safe_str(row.get("offending_component_length")),
         "status": status,
         "exit_code": exit_code,
         "contract_dir": str(contract_dir),
@@ -513,7 +575,18 @@ def summarize_contract(
         candidates = pd.read_csv(candidates_path, low_memory=False)
         summary["candidate_rows"] = int(len(candidates))
         if "status" in candidates.columns:
-            summary["ok_candidate_rows"] = int(candidates["status"].astype(str).eq("OK").sum())
+            candidate_statuses = candidates["status"].astype(str)
+            summary["ok_candidate_rows"] = int(candidate_statuses.eq("OK").sum())
+            if status == "OK" and summary["ok_candidate_rows"] == 0 and not candidates.empty:
+                if "failure_class" in candidates.columns:
+                    failure_classes = candidates["failure_class"].astype(str)
+                    failure_classes = failure_classes[failure_classes.str.len() > 0]
+                    if not failure_classes.empty:
+                        summary["status"] = safe_str(failure_classes.value_counts().index[0])
+                    else:
+                        summary["status"] = safe_str(candidate_statuses.value_counts().index[0]) or "TRAIN_FAILED"
+                else:
+                    summary["status"] = safe_str(candidate_statuses.value_counts().index[0]) or "TRAIN_FAILED"
         for column in [
             "projected_candidate_dir_length",
             "projected_longest_artifact_path_length",
@@ -983,6 +1056,196 @@ def render_summary(batch_dir: Path, grid_path: Path, rows: list[dict[str, Any]],
     return "\n".join(lines) + "\n"
 
 
+def aggregate_walkforward_artifacts(batch_dir: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    targets = {
+        "contract_leaderboard.csv": "combined_contract_leaderboards.csv",
+        "candidates.csv": "combined_candidates.csv",
+        "selected_by_window.csv": "combined_selected_by_window.csv",
+    }
+    result: dict[str, Any] = {}
+    for source_name, output_name in targets.items():
+        frames: list[pd.DataFrame] = []
+        for row in rows:
+            wf_dir_text = safe_str(row.get("walkforward_run_dir"))
+            if not wf_dir_text:
+                continue
+            wf_dir = Path(wf_dir_text)
+            frame = read_csv_or_empty(wf_dir / source_name)
+            if frame.empty:
+                continue
+            prefix = pd.DataFrame(
+                {
+                    "discovery_status": [safe_str(row.get("status"))] * len(frame),
+                    "discovery_contract_slug": [safe_str(row.get("contract_slug"))] * len(frame),
+                    "discovery_contract_dir": [safe_str(row.get("contract_dir"))] * len(frame),
+                    "discovery_walkforward_run_dir": [str(wf_dir)] * len(frame),
+                }
+            )
+            frame = pd.concat([prefix, frame.reset_index(drop=True)], axis=1)
+            frames.append(frame)
+        combined = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+        output_path = batch_dir / output_name
+        combined.to_csv(output_path, index=False)
+        result[output_name] = str(output_path)
+        result[f"{output_name}_rows"] = int(len(combined))
+    return result
+
+
+def top_preliminary_contracts(batch_dir: Path, limit: int = 10) -> list[dict[str, Any]]:
+    leaderboard = read_csv_or_empty(batch_dir / "combined_contract_leaderboards.csv")
+    if leaderboard.empty:
+        return []
+    for column in [
+        "best_label_rank_score",
+        "positive_test_window_fraction",
+        "total_test_cumulative_return_bps",
+        "mean_test_avg_return_bps",
+        "valid_rank_windows",
+        "baseline_guard_pass_windows",
+        "total_test_rows",
+    ]:
+        if column in leaderboard.columns:
+            leaderboard[column] = pd.to_numeric(leaderboard[column], errors="coerce")
+    if "ranking_mode" in leaderboard.columns:
+        label_rows = leaderboard[leaderboard["ranking_mode"].astype(str).eq("label_metrics")].copy()
+    else:
+        label_rows = pd.DataFrame()
+    if not label_rows.empty:
+        sort_cols = [
+            column
+            for column in [
+                "positive_test_window_fraction",
+                "valid_rank_windows",
+                "best_label_rank_score",
+                "baseline_guard_pass_windows",
+                "total_test_rows",
+            ]
+            if column in label_rows.columns
+        ]
+        return label_rows.sort_values(sort_cols, ascending=[False] * len(sort_cols)).head(limit).to_dict(orient="records")
+    sort_cols = [
+        column
+        for column in [
+            "positive_test_window_fraction",
+            "total_test_cumulative_return_bps",
+            "mean_test_avg_return_bps",
+            "total_test_rows",
+        ]
+        if column in leaderboard.columns
+    ]
+    if sort_cols:
+        leaderboard = leaderboard.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+    return leaderboard.head(limit).to_dict(orient="records")
+
+
+def render_evidence_report(
+    batch_dir: Path,
+    grid_path: Path,
+    rows: list[dict[str, Any]],
+    aggregate_info: dict[str, Any],
+) -> str:
+    status_counts: dict[str, int] = {}
+    for row in rows:
+        status = safe_str(row.get("status")) or "UNKNOWN"
+        status_counts[status] = status_counts.get(status, 0) + 1
+    completed = [row for row in rows if safe_str(row.get("status")) == "OK"]
+    failed = [row for row in rows if safe_str(row.get("status")) not in {"OK", "DRY_RUN"}]
+    top_rows = top_preliminary_contracts(batch_dir, 10)
+    lines = [
+        "Rawseq I/O Discovery Evidence Report",
+        "",
+        f"Batch dir: {batch_dir}",
+        f"Grid path: {grid_path}",
+        "Evidence classification: preliminary target/baseline discovery only.",
+        "No row in this report is credible, clean, promotable, or champion-ready.",
+        "",
+        "Safety:",
+        "  public_recorded_data_only=true",
+        "  private_api=false",
+        "  orders=false",
+        "  promotion=false",
+        "  champion_mutation=false",
+        "",
+        "Status counts:",
+    ]
+    for key in sorted(status_counts):
+        lines.append(f"  {key}: {status_counts[key]}")
+    lines += [
+        "",
+        "Completed contracts:",
+    ]
+    if not completed:
+        lines.append("  none")
+    else:
+        for row in completed[:50]:
+            lines.append(
+                "  "
+                f"{safe_str(row.get('contract_slug'))} "
+                f"label={safe_str(row.get('output_label'))} "
+                f"feature={safe_str(row.get('input_feature'))} "
+                f"fw={safe_str(row.get('feature_window'))} "
+                f"hidden={safe_str(row.get('hidden'))} "
+                f"candidates={safe_str(row.get('candidate_rows'))} ok={safe_str(row.get('ok_candidate_rows'))}"
+            )
+    lines += ["", "Failed or skipped contracts:"]
+    if not failed:
+        lines.append("  none")
+    else:
+        for row in failed[:80]:
+            reason = safe_str(row.get("path_guard_reason")) or safe_str(row.get("exit_code")) or "see log"
+            lines.append(
+                "  "
+                f"{safe_str(row.get('status'))} {safe_str(row.get('contract_slug'))} "
+                f"attempted_len={safe_str(row.get('attempted_path_length'))} "
+                f"max_len={safe_str(row.get('max_allowed_path_length'))} "
+                f"reason={reason}"
+            )
+    lines += [
+        "",
+        "Combined artifacts:",
+        f"  combined_contract_leaderboards.csv rows={aggregate_info.get('combined_contract_leaderboards.csv_rows', 0)}",
+        f"  combined_candidates.csv rows={aggregate_info.get('combined_candidates.csv_rows', 0)}",
+        f"  combined_selected_by_window.csv rows={aggregate_info.get('combined_selected_by_window.csv_rows', 0)}",
+        "",
+        "Preliminary target/horizon contracts worth testing next:",
+    ]
+    if not top_rows:
+        lines.append("  none from this batch; treat this as infrastructure smoke only.")
+    else:
+        for row in top_rows:
+            ranking_mode = safe_str(row.get("ranking_mode"))
+            score_value = row.get("best_label_rank_score") if ranking_mode == "label_metrics" else row.get("total_test_cumulative_return_bps")
+            if not safe_str(score_value):
+                score_value = row.get("mean_test_avg_return_bps")
+            lines.append(
+                "  "
+                f"{safe_str(row.get('input_feature'))} "
+                f"ma={safe_str(row.get('ma_window'))} fw={safe_str(row.get('feature_window'))} "
+                f"hidden={safe_str(row.get('hidden'))} stride={safe_str(row.get('input_stride'))}/{safe_str(row.get('output_stride'))} "
+                f"label={safe_str(row.get('output_label'))} "
+                f"rank_mode={ranking_mode} "
+                f"valid_windows={safe_str(row.get('valid_rank_windows'))} "
+                f"score={safe_str(score_value)}"
+            )
+    next_command = (
+        '$env:RAWSEQ_IO_GRID_PATH="' + str(grid_path) + '"; '
+        '$env:RAWSEQ_IO_DISCOVERY_OUTPUT_ROOT="F:\\rsio"; '
+        '$env:RAWSEQ_IO_DISCOVERY_DRY_RUN="false"; '
+        f'$env:RAWSEQ_IO_DISCOVERY_MAX_CONTRACTS="{MAX_CONTRACTS}"; '
+        "python scripts/tiny/run_rawseq_io_contract_discovery_batch.py"
+    )
+    lines += [
+        "",
+        "Interpretation:",
+        "  These outputs only prove that the target/baseline discovery plumbing can run under the short root.",
+        "  Model-quality evidence still requires untouched holdout or true forward-paper evaluation with position-aware metrics.",
+        "",
+        "Exact next command:",
+        f"  {next_command}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     if not WF_SCRIPT.exists():
         raise SystemExit(f"Missing walk-forward script: {WF_SCRIPT}")
@@ -1041,12 +1304,17 @@ def main() -> int:
 
     summary_csv = batch_dir / "io_contract_discovery_summary.csv"
     summary_txt = batch_dir / "io_contract_discovery_summary.txt"
+    aggregate_info = aggregate_walkforward_artifacts(batch_dir, rows)
+    evidence_report = batch_dir / "rawseq_io_discovery_evidence_report.txt"
     pd.DataFrame(rows).to_csv(summary_csv, index=False)
     summary_txt.write_text(render_summary(batch_dir, grid_path, rows, started), encoding="utf-8")
+    evidence_report.write_text(render_evidence_report(batch_dir, grid_path, rows, aggregate_info), encoding="utf-8")
     metadata = {
         "created_at": now_stamp(),
         "grid_path": str(grid_path),
         "batch_dir": str(batch_dir),
+        "aggregate_outputs": aggregate_info,
+        "evidence_report": str(evidence_report),
         "dry_run": DRY_RUN,
         "max_contracts": MAX_CONTRACTS,
         "max_candidates": MAX_CANDIDATES,
@@ -1063,6 +1331,7 @@ def main() -> int:
     print(f"Contracts attempted: {len(rows)}")
     print(f"CSV: {summary_csv}")
     print(f"TXT: {summary_txt}")
+    print(f"Evidence report: {evidence_report}")
     print("Safety: public recorded data only. No private API. No orders. No champion mutation. No promotion.")
     return 0
 
