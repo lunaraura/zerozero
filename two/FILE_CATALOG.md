@@ -2,6 +2,10 @@
 
 _Generated 2026-07-10 16:10:51Z from tracked files plus local source-like files._
 
+_Manual update 2026-07-10 23:55Z: added the canonical rawseq schema/data-contract packet, source inventory, schema audit report, and generated artifact-family notes. This update is documentation/catalog only._
+
+_Manual update 2026-07-11 00:25Z: added rawseq feature diagnostic registry script, tests, latest diagnostic artifact family, and ablation-unit notes._
+
 ## How to Use This Catalog
 
 This document is the human-oriented companion to `FILE_CATALOG.csv`. The CSV is the complete inventory; this Markdown file summarizes the important entry points, directory roles, generated-data families, and cleanup candidates.
@@ -15,6 +19,19 @@ This document is the human-oriented companion to `FILE_CATALOG.csv`. The CSV is 
 | Entry points detected | 200 |
 | Environment variables found | 1460 |
 | Generated families summarized | 9 |
+
+## Latest Manual Project Summary
+
+- The rawseq project now has versioned canonical schema JSON under `configs/rawseq`.
+- `scripts/tiny/rawseq_feature_label_registry.py` is JSON-backed and remains the compatibility surface for existing rawseq scripts.
+- `scripts/tiny/report_rawseq_source_column_inventory.py` inventories source CSV headers, cadence, semantic roles, sample dtype/ranges, and source-column readiness without loading full files.
+- `scripts/tiny/report_rawseq_schema_contracts.py` builds the full schema packet: source inventory, feature registry, materialized feature columns, label registry, materialized targets, tensor registry, lineage, compatibility matrices, unregistered columns, unresolved formulas, and a signed contract manifest.
+- Latest schema packet: `data/research/rawseq_schema_contracts/rawseq_schema_contract_20260710T235110Z`.
+- Latest packet status: `WARN`, with 0 unregistered feature columns and 0 unregistered target columns. WARN items are optional metadata arrays absent from older artifacts and implementation-specific formulas that still need documentation.
+- Latest feature diagnostics: `data/research/rawseq_feature_diagnostic_registry/rawseq_feature_diagnostic_registry_20260711T002251Z`, covering 267 materialized features and 6 target horizons.
+- Latest feature action counts: `keep=68`, `redundant=16`, `unstable=4`, `invalid=106`, `unresolved=73`.
+- Next controlled units are emitted in `feature_family_ablation_units.csv`: raw, raw+family, all registered freezeable features, and all-minus-one-family.
+- Safety posture for this update: report-only, no training, no discovery, no ensemble search, no freeze, no promotion, no champion mutation, no private API, and no orders.
 
 ## Category Counts
 
@@ -222,6 +239,15 @@ This document is the human-oriented companion to `FILE_CATALOG.csv`. The CSV is 
 
 ## Directory Catalog
 
+### `configs/rawseq`
+
+| File | Category | Status | Lines | Purpose |
+| --- | --- | --- | --- | --- |
+| [`rawseq_feature_schema_v1.json`](configs/rawseq/rawseq_feature_schema_v1.json) | rawseq schema | untracked | 416 | Canonical feature/source-column schema for rawseq research contracts. |
+| [`rawseq_feature_groups_v1.json`](configs/rawseq/rawseq_feature_groups_v1.json) | rawseq schema | untracked | 18 | Canonical feature-family grouping metadata. |
+| [`rawseq_label_schema_v1.json`](configs/rawseq/rawseq_label_schema_v1.json) | rawseq schema | untracked | 333 | Canonical output-label, horizon, task, and policy-compatibility schema. |
+| [`rawseq_tensor_contracts_v1.json`](configs/rawseq/rawseq_tensor_contracts_v1.json) | rawseq schema | untracked | 79 | Canonical tensor layout, split, timestamp, and required-array contracts. |
+
 ### `.`
 
 | File | Category | Status | Lines | Purpose |
@@ -238,6 +264,10 @@ This document is the human-oriented companion to `FILE_CATALOG.csv`. The CSV is 
 | [`sim_chart.html`](sim_chart.html) | node/browser app | tracked | 274 | Sim chart script/module. |
 
 ### `docs`
+
+| File | Category | Status | Lines | Purpose |
+| --- | --- | --- | --- | --- |
+| [`AI_PROJECT_TUTORIALS.txt`](docs/AI_PROJECT_TUTORIALS.txt) | documentation | untracked | 310 | ChatGPT/Codex-readable manual runbook with command sequences for project orientation, schema audits, feature diagnostics, bundle checks, and safety handoff. |
 
 | File | Category | Status | Lines | Purpose |
 | --- | --- | --- | --- | --- |
@@ -370,6 +400,7 @@ This document is the human-oriented companion to `FILE_CATALOG.csv`. The CSV is 
 | [`rawseq_candidate_behavior_archive.py`](scripts/tiny/rawseq_candidate_behavior_archive.py) | rawseq research | tracked | 530 | Build and query behavioral archives for rawseq candidate probes. |
 | [`rawseq_feature_label_registry.py`](scripts/tiny/rawseq_feature_label_registry.py) | rawseq research | untracked | 353 | Declarative registry for rawseq input features and output labels. |
 | [`rawseq_io_contract_grid.py`](scripts/tiny/rawseq_io_contract_grid.py) | rawseq research | modified | 360 | Emit rawseq input/output contract grids for batch discovery. |
+| [`report_rawseq_feature_diagnostic_registry.py`](scripts/tiny/report_rawseq_feature_diagnostic_registry.py) | rawseq schema | untracked | 602 | Build per-feature diagnostics, target correlations, univariate baselines, redundancy clusters, and ablation-unit manifests. |
 | [`report_ladder_walkforward_failure_attribution.py`](scripts/tiny/report_ladder_walkforward_failure_attribution.py) | ladder research | tracked | 340 | Explain ladder walk-forward failures with market and exit attribution. |
 | [`report_project_hygiene.py`](scripts/tiny/report_project_hygiene.py) | tiny research utility | tracked | 258 | Print a compact hygiene report for the tiny/rawseq workflow. |
 | [`report_rawseq_candidate_contract_inventory.py`](scripts/tiny/report_rawseq_candidate_contract_inventory.py) | rawseq research | tracked | 554 | Inventory SOLUSDT rawseq candidate model contracts. |
@@ -382,7 +413,9 @@ This document is the human-oriented companion to `FILE_CATALOG.csv`. The CSV is 
 | [`report_rawseq_overnight_grid_triage.py`](scripts/tiny/report_rawseq_overnight_grid_triage.py) | rawseq research | tracked | 696 | Triage archived rawseq grid runs for follow-up probe review. |
 | [`report_rawseq_probe_threshold_registry.py`](scripts/tiny/report_rawseq_probe_threshold_registry.py) | rawseq research | tracked | 865 | Build a threshold-aware registry of full-source rawseq candidate probes. |
 | [`report_rawseq_run_health.py`](scripts/tiny/report_rawseq_run_health.py) | rawseq research | tracked | 377 | Report health for tiny rawseq run folders. |
+| [`report_rawseq_schema_contracts.py`](scripts/tiny/report_rawseq_schema_contracts.py) | rawseq schema | untracked | 813 | Build the canonical rawseq source/feature/label/tensor/lineage schema audit packet. |
 | [`report_rawseq_scale_ensemble_candidates.py`](scripts/tiny/report_rawseq_scale_ensemble_candidates.py) | rawseq research | tracked | 592 | Build a temporal-scale leaderboard for rawseq probe candidates. |
+| [`report_rawseq_source_column_inventory.py`](scripts/tiny/report_rawseq_source_column_inventory.py) | rawseq schema | untracked | 291 | Inventory source CSV columns, cadence, semantic roles, sample stats, and pipeline usage. |
 | [`report_rawseq_walkforward_contract_survivors.py`](scripts/tiny/report_rawseq_walkforward_contract_survivors.py) | rawseq research | tracked | 482 | Select walk-forward rawseq contract representatives worth full-source probing. |
 | [`report_shadow_candidate_forward_comparison.py`](scripts/tiny/report_shadow_candidate_forward_comparison.py) | tiny research utility | modified | 464 | Compare frozen rawseq shadow candidates by latest forward paper run. |
 | [`run_frozen_shadow_candidate_forward_paper.py`](scripts/tiny/run_frozen_shadow_candidate_forward_paper.py) | tiny research utility | tracked | 541 | Run a frozen rawseq research shadow candidate on forward recorded data. |
@@ -434,6 +467,8 @@ This document is the human-oriented companion to `FILE_CATALOG.csv`. The CSV is 
 | File | Category | Status | Lines | Purpose |
 | --- | --- | --- | --- | --- |
 | [`test_rawseq_baseline_guard.py`](tests/test_rawseq_baseline_guard.py) | test | modified | 171 | Test rawseq baseline guard script/module. |
+| [`test_rawseq_feature_diagnostic_registry.py`](tests/test_rawseq_feature_diagnostic_registry.py) | test | untracked | 63 | Regression tests for feature diagnostic action rules, redundancy clusters, and univariate baselines. |
+| [`test_rawseq_schema_contracts.py`](tests/test_rawseq_schema_contracts.py) | test | untracked | 146 | Regression tests for schema uniqueness, source cadence, tensor shapes, and policy-label compatibility. |
 | [`test_tiny_io.py`](tests/test_tiny_io.py) | test | tracked | 127 | Test tiny io script/module. |
 
 ### `tiny`
@@ -458,6 +493,9 @@ This document is the human-oriented companion to `FILE_CATALOG.csv`. The CSV is 
 | data/rawseq_runs | 2136 | 134274066435 | Archived rawseq training/evaluation runs and overnight grid outputs. | data/rawseq_runs/champ_policy_all_runs.csv; data/rawseq_runs/champ_policy_rollup.csv; data/rawseq_runs/hist_policy_all_runs.csv |
 | data/rawseq_walkforward | 7676 | 38459264183 | Recorded walk-forward rawseq discovery run folders. | data/rawseq_walkforward/logs/walkforward_SOLUSDT_10x_20260709_142624.log; data/rawseq_walkforward/logs/walkforward_SOLUSDT_20260709_140018.log; data/rawseq_walkforward/solusdt_kraken_rawseq_wf_20260709T190024Z/candidates.csv |
 | data/research | 1381 | 8305623208 | Research-only probes, registries, ensembles, ladder baselines, and policy comparisons. | data/research/CURRENT_SAFETY_STATE.txt; data/research/rawseq_label_smoke_source.csv; data/research/rawseq_candidate_shadow_probes/scale_ensemble_candidates.csv |
+| data/research/rawseq_schema_contracts | generated | generated | Canonical rawseq schema audit packets with contract manifests, source inventory, feature/label/tensor registries, lineage, and compatibility matrices. | data/research/rawseq_schema_contracts/rawseq_schema_contract_20260710T235110Z/schema_audit_summary.md |
+| data/research/rawseq_feature_diagnostic_registry | generated | generated | Feature diagnostic registry packets with per-column diagnostics, target correlations, univariate baselines, redundancy clusters, and ablation-unit manifests. | data/research/rawseq_feature_diagnostic_registry/rawseq_feature_diagnostic_registry_20260711T002251Z/feature_diagnostic_summary.md |
+| data/research/rawseq_source_column_inventory | generated | generated | Source-column inventory packets for recorded/public flow CSVs. | data/research/rawseq_source_column_inventory/rawseq_source_column_inventory_20260710T234830Z/source_column_inventory.csv |
 | data/paper_champions | 5 | 423218995 | Frozen paper champion folders; audit before trusting historical folders. | data/paper_champions/rawseq_fade_ma_distance_60_h2x2_v1/annotated_seed_1000.csv; data/paper_champions/rawseq_fade_ma_distance_60_h2x2_v1/champion_spec.txt; data/paper_champions/rawseq_fade_ma_distance_60_h2x2_v1/evaluation_seed_1000.csv |
 | models/candidates | 2803 | 209493257 | Candidate model artifacts produced by trainers. | models/candidates/SOLUSDT/20260627T130438Z/model.json; models/candidates/SOLUSDT/20260627T130438Z/validation_metrics.csv; models/candidates/SOLUSDT/20260627T132644Z/baseline_metrics.csv |
 | models/active | 0 | 0 | Active model payloads used by older runtime scripts. |  |

@@ -2,6 +2,10 @@
 
 _Last generated: 2026-07-10 16:10:51Z from a static scan of the local repository._
 
+_Manual update: 2026-07-10 23:55Z. Added the canonical rawseq schema/data-contract packet, source-column inventory, schema audit outputs, and updated directory notes. No training, tuning, promotion, champion mutation, private API, or orders were run during this documentation refresh._
+
+_Manual update: 2026-07-11 00:25Z. Added the rawseq feature diagnostic registry and feature-family ablation-unit manifest. This was a report-only diagnostics pass over existing artifacts._
+
 ## Overview
 
 This workspace is a research-heavy crypto market microstructure and tiny-model lab. It contains Node/browser experiments, Python feature builders, live/public data recorders, model trainers, backtests, raw sequence (`rawseq`) candidate discovery, paper-only shadow candidate evaluation, ladder/grid baseline simulation, and reporting utilities.
@@ -16,6 +20,10 @@ The current center of gravity is SOLUSDT/Kraken recorded-public flow research. M
 - Python/Node entry-point style scripts detected: **200**.
 - Generated artifact families summarized: **9**.
 - Working tree statuses seen during scan: modified=12, tracked=231, untracked=2.
+- Latest schema-contract audit: `data/research/rawseq_schema_contracts/rawseq_schema_contract_20260710T235110Z`, status `WARN` with 0 unregistered feature columns and 0 unregistered target columns.
+- Latest source-column inventory: `data/research/rawseq_source_column_inventory/rawseq_source_column_inventory_20260710T234830Z`.
+- Latest feature diagnostics: `data/research/rawseq_feature_diagnostic_registry/rawseq_feature_diagnostic_registry_20260711T002251Z`, covering 267 materialized features and 6 target horizons.
+- Current rawseq stage: schema registration and column lineage are substantially complete; formula documentation is incomplete; column diagnostics are produced; feature-family ablation is the next bounded modeling step; model tuning and freezeable training remain later.
 
 ## Safety Posture
 
@@ -53,6 +61,7 @@ flowchart TD
 | --- | --- | --- |
 | scripts/ | Python/Node builders, trainers, evaluators, recorders, and reports. | Commit source; review live/promotion scripts carefully. |
 | scripts/tiny/ | Rawseq, shadow-candidate, ladder, registry, ensemble, and policy research tools. | Commit source; outputs go under data/research or data/rawseq_* folders. |
+| configs/rawseq/ | Canonical rawseq schema JSON for feature definitions, labels, feature groups, and tensor contracts. | Commit schema source; treat as versioned contract material. |
 | src/ | Node/browser market data and modeling utilities. | Commit source. |
 | tiny/core/ | Shared tiny path and I/O helpers. | Commit source. |
 | tests/ | Focused regression tests for helper contracts and rawseq guards. | Commit tests. |
@@ -60,11 +69,57 @@ flowchart TD
 | data/ | Recorded/generated datasets, reports, paper candidates, and research artifacts. | Usually do not commit bulk files. |
 | models/ | Candidate/active/selected model artifacts. | Usually do not commit unless explicitly freezing an artifact. |
 
+For AI handoffs and manual command sequences, start with [`docs/AI_PROJECT_TUTORIALS.txt`](docs/AI_PROJECT_TUTORIALS.txt). It is a plain-text runbook designed for ChatGPT/Codex readability.
+
 ## Rawseq Concepts
 
 Rawseq models consume a fixed-length sequence of scalar input values and predict a path-shaped output. The core trainer is [`scripts/tiny_price_rawseq_path_v1.py`](scripts/tiny_price_rawseq_path_v1.py). Orchestration lives in [`scripts/tiny/run_rawseq_recorded_walkforward_evolution.py`](scripts/tiny/run_rawseq_recorded_walkforward_evolution.py) and [`scripts/tiny/run_rawseq_io_contract_discovery_batch.py`](scripts/tiny/run_rawseq_io_contract_discovery_batch.py).
 
 Important contract fields include `symbol`, venue, `source_path`, `bucket_seconds`, `seq_len`, input/output stride, `input_feature`, `ma_window`, `feature_window`, hidden architecture, inferred `W1`/`W2`/`W3` shapes, `output_label`, `output_orientation`, `task_type`, `output_dim`, seed, population, generations, epochs, split windows, source hashes, and safety metadata.
+
+## Canonical Rawseq Schema Contract
+
+The canonical rawseq data contract now lives under [`configs/rawseq`](configs/rawseq):
+
+- [`rawseq_feature_schema_v1.json`](configs/rawseq/rawseq_feature_schema_v1.json): source-column, feature-window, causality, missing-value, scaling, and policy compatibility definitions.
+- [`rawseq_label_schema_v1.json`](configs/rawseq/rawseq_label_schema_v1.json): output labels, target layouts, horizon semantics, leakage warnings, and compatible policy adapters.
+- [`rawseq_feature_groups_v1.json`](configs/rawseq/rawseq_feature_groups_v1.json): feature-family grouping used by multi-horizon indicator artifacts.
+- [`rawseq_tensor_contracts_v1.json`](configs/rawseq/rawseq_tensor_contracts_v1.json): tensor layouts, required arrays, split/timestamp semantics, and shape contracts.
+
+The JSON-backed registry remains exposed through [`scripts/tiny/rawseq_feature_label_registry.py`](scripts/tiny/rawseq_feature_label_registry.py). The source-column inventory is generated by [`scripts/tiny/report_rawseq_source_column_inventory.py`](scripts/tiny/report_rawseq_source_column_inventory.py). The full artifact/schema audit is generated by [`scripts/tiny/report_rawseq_schema_contracts.py`](scripts/tiny/report_rawseq_schema_contracts.py).
+
+Latest audit packet:
+
+- `data/research/rawseq_schema_contracts/rawseq_schema_contract_20260710T235110Z/schema_contract.json`
+- `data/research/rawseq_schema_contracts/rawseq_schema_contract_20260710T235110Z/schema_audit_summary.md`
+- `data/research/rawseq_schema_contracts/rawseq_schema_contract_20260710T235110Z/source_column_inventory.csv`
+- `data/research/rawseq_schema_contracts/rawseq_schema_contract_20260710T235110Z/rawseq_column_lineage.csv`
+
+The latest audit is `WARN`, not `FAIL`: old sequence artifacts lack optional newly introduced arrays, and 139 materialized formulas remain implementation-specific/unresolved for documentation. There are 0 unregistered feature columns and 0 unregistered target columns.
+
+## Feature Diagnostic Registry
+
+The current feature diagnostic registry is generated by [`scripts/tiny/report_rawseq_feature_diagnostic_registry.py`](scripts/tiny/report_rawseq_feature_diagnostic_registry.py). It is report-only and computes per-materialized-feature diagnostics:
+
+- variance, nonfinite fraction, missing fraction, constant/near-constant status, and extreme-value rate,
+- train-fitted scaler parameters and validation out-of-range rate,
+- correlation against every target horizon,
+- univariate train/validation baseline metrics,
+- time-block stability,
+- redundancy cluster membership,
+- feature-family membership,
+- recommended action: `keep`, `keep_for_ablation`, `redundant`, `unstable`, `invalid`, or `unresolved`.
+
+Latest packet:
+
+- `data/research/rawseq_feature_diagnostic_registry/rawseq_feature_diagnostic_registry_20260711T002251Z/feature_diagnostic_registry.csv`
+- `data/research/rawseq_feature_diagnostic_registry/rawseq_feature_diagnostic_registry_20260711T002251Z/feature_target_correlations.csv`
+- `data/research/rawseq_feature_diagnostic_registry/rawseq_feature_diagnostic_registry_20260711T002251Z/feature_univariate_baselines.csv`
+- `data/research/rawseq_feature_diagnostic_registry/rawseq_feature_diagnostic_registry_20260711T002251Z/feature_family_ablation_units.csv`
+
+Latest action counts: `keep=68`, `redundant=16`, `unstable=4`, `invalid=106`, `unresolved=73`. Invalid and unresolved features should not be used in freezeable model contracts. Redundant/unstable/keep-for-ablation features may be useful for research ablation, but should not be promoted blindly.
+
+Controlled ablation units are now emitted as `raw`, `raw_plus_trend`, `raw_plus_momentum`, `raw_plus_volatility`, `raw_plus_breakout`, `raw_plus_volume`, `raw_plus_order_book`, `raw_plus_regime`, `raw_plus_cross_market`, `all_registered_features`, and `all_minus_<family>`.
 
 ## Rawseq Input Features
 

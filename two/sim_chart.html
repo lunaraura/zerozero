@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Synthetic Market Simulation Chart</title>
+  <style>
+    body {
+      font-family: system-ui, Arial, sans-serif;
+      margin: 20px;
+      background: #111;
+      color: #eee;
+    }
+
+    h1 {
+      margin-bottom: 8px;
+    }
+
+    .controls {
+      margin: 14px 0 18px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    input, button, select {
+      font: inherit;
+      padding: 6px 8px;
+    }
+
+    canvas {
+      background: #181818;
+      border: 1px solid #333;
+      display: block;
+      width: 100%;
+      max-width: 1200px;
+      height: 520px;
+    }
+
+    .stats {
+      margin-top: 14px;
+      font-family: ui-monospace, Consolas, monospace;
+      white-space: pre-wrap;
+      color: #ccc;
+    }
+  </style>
+</head>
+<body>
+  <h1>Synthetic Market Simulation Chart</h1>
+
+  <div class="controls">
+    <input id="fileInput" type="file" accept=".csv" />
+    <label>
+      Metric:
+      <select id="metricSelect">
+        <option value="mid_price">mid_price</option>
+        <option value="spread_percent">spread_percent</option>
+        <option value="market_pressure_10s">market_pressure_10s</option>
+        <option value="order_book_imbalance_10bps">order_book_imbalance_10bps</option>
+        <option value="bid_depth_10bps">bid_depth_10bps</option>
+        <option value="ask_depth_10bps">ask_depth_10bps</option>
+        <option value="total_trade_volume_10s">total_trade_volume_10s</option>
+        <option value="trade_count_10s">trade_count_10s</option>
+      </select>
+    </label>
+    <button id="redrawBtn">Redraw</button>
+  </div>
+
+  <canvas id="chart" width="1200" height="520"></canvas>
+  <div id="stats" class="stats">Select a simulator CSV file.</div>
+
+  <script>
+    "use strict";
+
+    const fileInput = document.getElementById("fileInput");
+    const metricSelect = document.getElementById("metricSelect");
+    const redrawBtn = document.getElementById("redrawBtn");
+    const canvas = document.getElementById("chart");
+    const ctx = canvas.getContext("2d");
+    const statsEl = document.getElementById("stats");
+
+    let rows = [];
+
+    function parseCSV(text) {
+      const lines = text.trim().split(/\r?\n/);
+      if (lines.length < 2) return [];
+
+      const headers = splitCSVLine(lines[0]).map(h => h.trim());
+      const out = [];
+
+      for (let i = 1; i < lines.length; i++) {
+        const values = splitCSVLine(lines[i]);
+        if (values.length !== headers.length) continue;
+
+        const row = {};
+        for (let j = 0; j < headers.length; j++) {
+          row[headers[j]] = values[j];
+        }
+        out.push(row);
+      }
+
+      return out;
+    }
+
+    function splitCSVLine(line) {
+      const out = [];
+      let current = "";
+      let inQuotes = false;
+
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        const next = line[i + 1];
+
+        if (ch === '"' && inQuotes && next === '"') {
+          current += '"';
+          i++;
+        } else if (ch === '"') {
+          inQuotes = !inQuotes;
+        } else if (ch === "," && !inQuotes) {
+          out.push(current);
+          current = "";
+        } else {
+          current += ch;
+        }
+      }
+
+      out.push(current);
+      return out;
+    }
+
+    function num(v) {
+      const x = Number(v);
+      return Number.isFinite(x) ? x : NaN;
+    }
+
+    function drawChart(metric) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const valid = rows
+        .map((r, i) => ({
+          i,
+          time: r.time || String(r.timestamp || i),
+          value: num(r[metric]),
+          mid: num(r.mid_price),
+          event: String(r.hidden_active_event_type || "none")
+        }))
+        .filter(r => Number.isFinite(r.value));
+
+      if (!valid.length) {
+        statsEl.textContent = `No numeric values found for ${metric}.`;
+        return;
+      }
+
+      const padL = 70;
+      const padR = 20;
+      const padT = 30;
+      const padB = 55;
+      const w = canvas.width - padL - padR;
+      const h = canvas.height - padT - padB;
+
+      const minY = Math.min(...valid.map(r => r.value));
+      const maxY = Math.max(...valid.map(r => r.value));
+      const yRange = Math.max(maxY - minY, 1e-12);
+
+      function xAt(k) {
+        return padL + (k / Math.max(valid.length - 1, 1)) * w;
+      }
+
+      function yAt(v) {
+        return padT + (1 - (v - minY) / yRange) * h;
+      }
+
+      // Grid
+      ctx.strokeStyle = "#2b2b2b";
+      ctx.lineWidth = 1;
+      ctx.fillStyle = "#aaa";
+      ctx.font = "12px system-ui";
+
+      for (let g = 0; g <= 5; g++) {
+        const y = padT + (g / 5) * h;
+        const value = maxY - (g / 5) * yRange;
+
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(canvas.width - padR, y);
+        ctx.stroke();
+
+        ctx.fillText(value.toFixed(6), 8, y + 4);
+      }
+
+      // Axes
+      ctx.strokeStyle = "#555";
+      ctx.beginPath();
+      ctx.moveTo(padL, padT);
+      ctx.lineTo(padL, canvas.height - padB);
+      ctx.lineTo(canvas.width - padR, canvas.height - padB);
+      ctx.stroke();
+
+      // Event shading
+      for (let i = 0; i < valid.length; i++) {
+        if (valid[i].event && valid[i].event !== "none" && valid[i].event !== "") {
+          const x = xAt(i);
+          ctx.fillStyle = "rgba(255, 255, 255, 0.08)";
+          ctx.fillRect(x, padT, Math.max(2, w / valid.length), h);
+        }
+      }
+
+      // Line
+      ctx.strokeStyle = "#6fb7ff";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+
+      for (let i = 0; i < valid.length; i++) {
+        const x = xAt(i);
+        const y = yAt(valid[i].value);
+
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+
+      ctx.stroke();
+
+      // Labels
+      ctx.fillStyle = "#eee";
+      ctx.font = "14px system-ui";
+      ctx.fillText(metric, padL, 20);
+
+      ctx.fillStyle = "#aaa";
+      ctx.font = "12px system-ui";
+      ctx.fillText(valid[0].time, padL, canvas.height - 22);
+      ctx.fillText(valid[valid.length - 1].time, canvas.width - 260, canvas.height - 22);
+
+      const eventCounts = {};
+      for (const r of valid) {
+        const e = r.event || "none";
+        eventCounts[e] = (eventCounts[e] || 0) + 1;
+      }
+
+      const first = valid[0].value;
+      const last = valid[valid.length - 1].value;
+      const change = ((last / first) - 1) * 100;
+
+      statsEl.textContent =
+        `Rows plotted: ${valid.length}\n` +
+        `Metric: ${metric}\n` +
+        `Min: ${minY}\n` +
+        `Max: ${maxY}\n` +
+        `First: ${first}\n` +
+        `Last: ${last}\n` +
+        `Change: ${Number.isFinite(change) ? change.toFixed(4) + "%" : "n/a"}\n` +
+        `Event counts: ${JSON.stringify(eventCounts, null, 2)}`;
+    }
+
+    fileInput.addEventListener("change", async () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+
+      const text = await file.text();
+      rows = parseCSV(text);
+
+      statsEl.textContent = `Loaded ${rows.length} rows from ${file.name}`;
+      drawChart(metricSelect.value);
+    });
+
+    redrawBtn.addEventListener("click", () => {
+      drawChart(metricSelect.value);
+    });
+
+    metricSelect.addEventListener("change", () => {
+      drawChart(metricSelect.value);
+    });
+  </script>
+</body>
+</html>
