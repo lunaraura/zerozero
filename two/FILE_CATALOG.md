@@ -6,9 +6,13 @@ _Manual update 2026-07-10 23:55Z: added the canonical rawseq schema/data-contrac
 
 _Manual update 2026-07-11 00:25Z: added rawseq feature diagnostic registry script, tests, latest diagnostic artifact family, and ablation-unit notes._
 
+_Manual update 2026-07-15: added `docs/PROJECT_SCRIPT_GENERATIONS.md`, a documentation-only script map grouped by de-facto project generation. Use it before the flat catalog when deciding which scripts are current versus historical._
+
 ## How to Use This Catalog
 
 This document is the human-oriented companion to `FILE_CATALOG.csv`. The CSV is the complete inventory; this Markdown file summarizes the important entry points, directory roles, generated-data families, and cleanup candidates.
+
+For current project navigation, start with [`docs/PROJECT_SCRIPT_GENERATIONS.md`](docs/PROJECT_SCRIPT_GENERATIONS.md). This catalog is intentionally broad and includes many historical scripts; the generation map is the safer first stop for current rawseq1m and future-shadow work.
 
 ## Inventory Summary
 

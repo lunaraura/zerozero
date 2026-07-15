@@ -6,6 +6,8 @@ _Manual update: 2026-07-10 23:55Z. Added the canonical rawseq schema/data-contra
 
 _Manual update: 2026-07-11 00:25Z. Added the rawseq feature diagnostic registry and feature-family ablation-unit manifest. This was a report-only diagnostics pass over existing artifacts._
 
+_Manual update: 2026-07-15. Added [`docs/PROJECT_SCRIPT_GENERATIONS.md`](docs/PROJECT_SCRIPT_GENERATIONS.md), a documentation-only map that groups scripts by de-facto project generation and marks current, support, and historical lanes._
+
 ## Overview
 
 This workspace is a research-heavy crypto market microstructure and tiny-model lab. It contains Node/browser experiments, Python feature builders, live/public data recorders, model trainers, backtests, raw sequence (`rawseq`) candidate discovery, paper-only shadow candidate evaluation, ladder/grid baseline simulation, and reporting utilities.
@@ -70,6 +72,8 @@ flowchart TD
 | models/ | Candidate/active/selected model artifacts. | Usually do not commit unless explicitly freezing an artifact. |
 
 For AI handoffs and manual command sequences, start with [`docs/AI_PROJECT_TUTORIALS.txt`](docs/AI_PROJECT_TUTORIALS.txt). It is a plain-text runbook designed for ChatGPT/Codex readability.
+
+For script navigation by project era, start with [`docs/PROJECT_SCRIPT_GENERATIONS.md`](docs/PROJECT_SCRIPT_GENERATIONS.md). It groups the large `scripts/tiny` surface into current 1m board/evolution work, frozen downside future-shadow operations, older rawseq 10s tooling, GPU/target-lane diagnostics, ladder/policy experiments, and legacy systems.
 
 ## Rawseq Concepts
 
